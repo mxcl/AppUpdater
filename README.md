@@ -31,6 +31,14 @@ import AppUpdater
 
 @NSApplicationMain
 class AppDelegate: NSObject, NSApplicationDelegate {
+    
     let updater = AppUpdater(owner: "your-github-username", repo: "your-github-repo-name")
+
+    //NOTE this is optional, the `AppUpdater` object schedules a daily update check itself    
+    @IBAction func userRequestedAnExplicitUpdateCheck() {
+        updater.check().catch { error in
+            // show alert
+        }
+    }
 }
 ```
