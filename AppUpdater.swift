@@ -185,7 +185,11 @@ private extension Array where Element == Release {
 private func unzip(_ url: URL, contentType: ContentType) -> Promise<URL> {
 
     let proc = Process()
-    proc.currentDirectoryURL = url.deletingLastPathComponent()
+    if #available(OSX 10.13, *) {
+        proc.currentDirectoryURL = url.deletingLastPathComponent()
+    } else {
+        proc.currentDirectoryPath = url.deletingLastPathComponent().path
+    }
 
     switch contentType {
     case .tar:
