@@ -8,7 +8,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/PromiseKit/Foundation", from: "3.3.0"),
-        .package(url: "https://github.com/mxcl/Path.swift", from: "0.15.1"),
+        .package(url: "https://github.com/mxcl/Path.swift", from: "0.16.0"),
         .package(url: "https://github.com/mxcl/Version", from: "1.0.0"),
     ],
     targets: [

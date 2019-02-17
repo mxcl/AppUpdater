@@ -47,6 +47,7 @@ public class AppUpdater {
     private enum Error: Swift.Error {
         case bundleExecutableURL
         case codeSigningIdentity
+        case invalidDownloadedBundle
     }
 
     public func check() -> Promise<Void> {
@@ -80,19 +81,27 @@ public class AppUpdater {
             }.compactMap { downloadedAppBundle in
                 Bundle(url: downloadedAppBundle)
             }.then { downloadedAppBundle -> Promise<Path> in
-                validate(codeSigning: .main, downloadedAppBundle).map{ downloadedAppBundle.path }
+                validate(codeSigning: .main, downloadedAppBundle)
             }.done { downloadedAppBundle in
 
                 // UNIX is cool. Delete ourselves, move new one in then restart.
 
-                let installedAppBundle = Bundle.main.path
+                let installedAppBundle = Bundle.main
+                guard let exe = downloadedAppBundle.executable, exe.exists else {
+                    throw Error.invalidDownloadedBundle
+                }
+                let finalExecutable = installedAppBundle.path/exe.relative(to: downloadedAppBundle.path)
 
-                try installedAppBundle.delete()
-                try downloadedAppBundle.move(to: installedAppBundle)
+                try installedAppBundle.path.delete()
+                try downloadedAppBundle.path.move(to: installedAppBundle.path)
                 try FileManager.default.removeItem(at: tmpdir)
 
                 let proc = Process()
-                proc.launchPath = installedAppBundle.Contents.MacOS.Cake.string
+                if #available(OSX 10.13, *) {
+                    proc.launchPath = finalExecutable.string
+                } else {
+                    proc.executableURL = finalExecutable.url
+                }
                 proc.launch()
 
                 // seems to work, though for sure, seems asking a lot for it to be reliable!
