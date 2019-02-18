@@ -9,4 +9,4 @@ osx_image:
 env:
   - CONF=release
   - CONF=debug
-script: swift build --configuration $CONF
+script: swift build --configuration $CONF -Xswiftc -warnings-as-errors
