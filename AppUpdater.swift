@@ -54,7 +54,7 @@ public class AppUpdater {
         guard active.isResolved else {
             return active
         }
-        guard let exename = Bundle.main.executableURL?.path else {
+        guard Bundle.main.executableURL != nil else {
             return Promise(error: Error.bundleExecutableURL)
         }
         let currentVersion = Bundle.main.version
@@ -80,8 +80,8 @@ public class AppUpdater {
                 unzip(dst, contentType: asset.content_type)
             }.compactMap { downloadedAppBundle in
                 Bundle(url: downloadedAppBundle)
-            }.then { downloadedAppBundle -> Promise<Path> in
-                validate(codeSigning: .main, downloadedAppBundle)
+            }.then { downloadedAppBundle in
+                validate(codeSigning: .main, downloadedAppBundle).map{ downloadedAppBundle }
             }.done { downloadedAppBundle in
 
                 // UNIX is cool. Delete ourselves, move new one in then restart.
@@ -98,9 +98,9 @@ public class AppUpdater {
 
                 let proc = Process()
                 if #available(OSX 10.13, *) {
-                    proc.launchPath = finalExecutable.string
-                } else {
                     proc.executableURL = finalExecutable.url
+                } else {
+                    proc.launchPath = finalExecutable.string
                 }
                 proc.launch()
 
