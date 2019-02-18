@@ -6,4 +6,7 @@ language: swift
 osx_image:
   - xcode10.2
   - xcode10.1
-script: swift build
+env:
+  - CONF=release
+  - CONF=debug
+script: swift build --configuration $CONF
