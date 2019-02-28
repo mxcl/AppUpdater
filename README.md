@@ -29,7 +29,7 @@ wage*. Please help me continue my work, I appreciate it 🙏🏻
 	<img src="https://c5.patreon.com/external/logo/become_a_patron_button@2x.png" width="160">
 </a>
 
-[Other ways to say thanks](http://mxcl.github.io/#donate).
+[Other ways to say thanks](http://mxcl.dev/#donate).
 
 [`brew`]: https://brew.sh
 
