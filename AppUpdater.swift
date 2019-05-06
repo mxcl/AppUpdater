@@ -18,7 +18,7 @@ public class AppUpdater {
         return "\(owner)/\(repo)"
     }
     
-    public var prerelease = false
+    public var allowPrereleases = false
 
     public init(owner: String, repo: String) {
         self.owner = owner
@@ -122,7 +122,7 @@ public class AppUpdater {
         }.map {
             try JSONDecoder().decode([Release].self, from: $0.data)
         }.compactMap { releases in
-            try releases.findViableUpdate(appVersion: currentVersion, repo: self.repo, prerelease: self.prerelease)
+            try releases.findViableUpdate(appVersion: currentVersion, repo: self.repo, prerelease: self.allowPrereleases)
         }.then { asset in
             try update(with: asset)
         }
