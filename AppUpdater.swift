@@ -17,6 +17,8 @@ public class AppUpdater {
     var slug: String {
         return "\(owner)/\(repo)"
     }
+    
+    public var allowPrereleases = false
 
     public init(owner: String, repo: String) {
         self.owner = owner
@@ -120,7 +122,7 @@ public class AppUpdater {
         }.map {
             try JSONDecoder().decode([Release].self, from: $0.data)
         }.compactMap { releases in
-            try releases.findViableUpdate(appVersion: currentVersion, repo: self.repo)
+            try releases.findViableUpdate(appVersion: currentVersion, repo: self.repo, prerelease: self.allowPrereleases)
         }.then { asset in
             try update(with: asset)
         }
@@ -183,9 +185,9 @@ extension Release: Comparable {
 }
 
 private extension Array where Element == Release {
-    func findViableUpdate(appVersion: Version, repo: String) throws -> Release.Asset? {
-        let properReleases = filter{ !$0.prerelease }
-        guard let latestRelease = properReleases.sorted().last else { return nil }
+    func findViableUpdate(appVersion: Version, repo: String, prerelease: Bool) throws -> Release.Asset? {
+        let suitableReleases = prerelease ? self : filter{ !$0.prerelease }
+        guard let latestRelease = suitableReleases.sorted().last else { return nil }
         guard appVersion < latestRelease.tag_name else { throw PMKError.cancelled }
         return latestRelease.viableAsset(forRepo: repo)
     }
