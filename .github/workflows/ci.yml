@@ -5,7 +5,7 @@ on:
       - .github/workflows/ci.yml
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-10.15
     strategy:
       matrix:
         xcode: [^10, ^11, ^12]
