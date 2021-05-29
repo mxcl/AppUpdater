@@ -1,8 +1,10 @@
 on:
   pull_request:
     paths:
-      - AppUpdater.swift
+      - '*.swift'
       - .github/workflows/ci.yml
+    schedule:
+      - cron: '3 3 * * 3'  # 3:03 AM, every Wednesday
 jobs:
   build:
     runs-on: macos-10.15
