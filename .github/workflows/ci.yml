@@ -13,8 +13,10 @@ jobs:
         xcode: [^10, ^11, ^12]
         conf: [release, debug]
     steps:
-    - uses: maxim-lobanov/setup-xcode@v1
-      with:
-        xcode-version: ${{ matrix.xcode }}
     - uses: actions/checkout@v2
-    - run: swift build --configuration ${{ matrix.conf }} -Xswiftc -warnings-as-errors
+    - uses: mxcl/xcodebuild@v1
+      with:
+        xcode: ${{ matrix.xcode }}
+        configuration: ${{ matrix.conf }}
+        warnings-as-errors: true
+        action: build
