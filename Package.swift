@@ -1,18 +1,26 @@
-// swift-tools-version:4.2
+// swift-tools-version: 6.0
 import PackageDescription
 
 let package = Package(
     name: "AppUpdater",
+    platforms: [
+        .macOS(.v12),
+    ],
     products: [
         .library(name: "AppUpdater", targets: ["AppUpdater"]),
     ],
-    dependencies: [
-        .package(url: "https://github.com/PromiseKit/Foundation", from: "3.3.0"),
-        .package(url: "https://github.com/mxcl/Path.swift", from: "1.0.0"),
-        .package(url: "https://github.com/mxcl/Version", from: "1.0.0"),
-    ],
     targets: [
-        .target(name: "AppUpdater", dependencies: ["PMKFoundation", "Path", "Version"], path: ".", sources: ["AppUpdater.swift"]),
+        .target(
+            name: "AppUpdater",
+            path: ".",
+            exclude: ["LICENSE.md", "README.md", "Tests"],
+            sources: ["AppUpdater.swift"]
+        ),
+        .testTarget(
+            name: "AppUpdaterTests",
+            dependencies: ["AppUpdater"],
+            path: "Tests"
+        ),
     ],
-    swiftLanguageVersions: [.v4_2, .version("5")]
+    swiftLanguageModes: [.v6]
 )
