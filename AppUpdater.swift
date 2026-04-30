@@ -5,14 +5,14 @@ import Version
 
 @MainActor
 public final class AppUpdater {
-    private var active: Task<Void, Swift.Error>?
+    private var active: Task<Update?, Swift.Error>?
     private let owner: String
     private let repo: String
     private let session: URLSession
     private let hasExecutable: @Sendable () -> Bool
     private let currentVersion: @Sendable () throws -> Version
     private let fetchReleases: @Sendable () async throws -> [Release]
-    private let updateAsset: @Sendable (Release.Asset) async throws -> Void
+    private let stageAsset: @Sendable (Release.Asset) async throws -> Update
 
     public var allowPrereleases = false
 
@@ -33,8 +33,8 @@ public final class AppUpdater {
                 session: session
             )
         }
-        updateAsset = { asset in
-            try await Self.update(with: asset, session: session)
+        stageAsset = { asset in
+            try await Self.stageUpdate(with: asset, session: session)
         }
     }
 
@@ -44,7 +44,7 @@ public final class AppUpdater {
         hasExecutable: @escaping @Sendable () -> Bool = { true },
         currentVersion: @escaping @Sendable () throws -> Version,
         fetchReleases: @escaping @Sendable () async throws -> [Release],
-        updateAsset: @escaping @Sendable (Release.Asset) async throws -> Void
+        stageAsset: @escaping @Sendable (Release.Asset) async throws -> Update
     ) {
         self.owner = owner
         self.repo = repo
@@ -52,10 +52,10 @@ public final class AppUpdater {
         self.hasExecutable = hasExecutable
         self.currentVersion = currentVersion
         self.fetchReleases = fetchReleases
-        self.updateAsset = updateAsset
+        self.stageAsset = stageAsset
     }
 
-    public func check() async throws {
+    public func check() async throws -> Update? {
         if let active {
             return try await active.value
         }
@@ -65,9 +65,9 @@ public final class AppUpdater {
         let hasExecutable = hasExecutable
         let currentVersion = currentVersion
         let fetchReleases = fetchReleases
-        let updateAsset = updateAsset
+        let stageAsset = stageAsset
 
-        let task = Task {
+        let task = Task<Update?, Swift.Error> {
             guard hasExecutable() else {
                 throw AppUpdaterError.bundleExecutableURL
             }
@@ -79,10 +79,10 @@ public final class AppUpdater {
                 repo: repo,
                 prerelease: allowPrereleases
             ) else {
-                return
+                return nil
             }
 
-            try await updateAsset(asset)
+            return try await stageAsset(asset)
         }
 
         active = task
@@ -111,10 +111,10 @@ public final class AppUpdater {
         return try decoder.decode([Release].self, from: data)
     }
 
-    private static func update(with asset: Release.Asset, session: URLSession) async throws {
-#if DEBUG
-        print("notice: AppUpdater dry-run:", asset)
-#else
+    private static func stageUpdate(
+        with asset: Release.Asset,
+        session: URLSession
+    ) async throws -> Update {
         guard asset.browserDownloadURL.scheme == "https" else {
             throw AppUpdaterError.insecureDownloadURL
         }
@@ -125,7 +125,6 @@ public final class AppUpdater {
             appropriateFor: Bundle.main.bundleURL,
             create: true
         )
-        defer { try? FileManager.default.removeItem(at: tmpdir) }
 
         let downloadURL = tmpdir.appendingPathComponent("download")
         let (downloadedURL, _) = try await session.download(
@@ -158,18 +157,38 @@ public final class AppUpdater {
         let finalExecutableURL = installedAppBundle.bundleURL
             .appendingPathComponent(relativeExecutablePath)
 
-        try FileManager.default.removeItem(at: installedAppBundle.bundleURL)
-        try FileManager.default.moveItem(
-            at: downloadedAppBundle.bundleURL,
-            to: installedAppBundle.bundleURL
+        return Update(
+            assetName: asset.name,
+            stagedBundleURL: downloadedAppBundle.bundleURL,
+            installedBundleURL: installedAppBundle.bundleURL,
+            executableURL: finalExecutableURL,
+            stagingDirectoryURL: tmpdir
         )
+    }
+}
 
+public struct Update: Sendable {
+    public let assetName: String
+    public let stagedBundleURL: URL
+    public let installedBundleURL: URL
+    public let executableURL: URL
+
+    let stagingDirectoryURL: URL
+
+    @MainActor
+    public func installAndRelaunch() async throws {
+        let helperURL = try InstallerHelper.writeScript(in: stagingDirectoryURL)
         let process = Process()
-        process.executableURL = finalExecutableURL
+        process.executableURL = helperURL
+        process.arguments = [
+            "\(getpid())",
+            stagedBundleURL.path,
+            installedBundleURL.path,
+            executableURL.path,
+            stagingDirectoryURL.path,
+        ]
         try process.run()
-
         NSApp.terminate(nil)
-#endif
     }
 }
 
@@ -182,7 +201,6 @@ enum AppUpdaterError: LocalizedError, Equatable {
     case insecureDownloadURL
     case missingCodeSigningInfo
     case mismatchedCodeSigningInfo
-    case noUpdateAvailable
     case processFailed(URL, Int32, String)
     case unsupportedContentType(String)
 
@@ -204,8 +222,6 @@ enum AppUpdaterError: LocalizedError, Equatable {
             "A bundle is missing required code-signing information."
         case .mismatchedCodeSigningInfo:
             "The downloaded app was signed by a different identity."
-        case .noUpdateAvailable:
-            "No update is available."
         case .processFailed(let executable, let status, let stderr):
             "\(executable.path) failed with status \(status): \(stderr)"
         case .unsupportedContentType(let contentType):
@@ -285,7 +301,7 @@ extension Array where Element == Release {
         let suitableReleases = prerelease ? self : filter { !$0.prerelease }
         for release in suitableReleases.sorted().reversed() {
             guard appVersion < release.tagName else {
-                throw AppUpdaterError.noUpdateAvailable
+                return nil
             }
             if let asset = release.viableAsset(forRepo: repo) {
                 return asset
@@ -437,6 +453,49 @@ enum CodeSignature {
             throw AppUpdaterError.mismatchedCodeSigningInfo
         }
     }
+}
+
+enum InstallerHelper {
+    static func writeScript(in directory: URL) throws -> URL {
+        let scriptURL = directory.appendingPathComponent("install-update.sh")
+        try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: scriptURL.path
+        )
+        return scriptURL
+    }
+
+    static let script = """
+    #!/bin/sh
+    set -eu
+
+    pid="$1"
+    staged_bundle="$2"
+    installed_bundle="$3"
+    executable="$4"
+    staging_directory="$5"
+    deadline=$(( $(date +%s) + 300 ))
+
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+            rm -rf "$staging_directory"
+            exit 1
+        fi
+        sleep 0.2
+    done
+
+    rm -rf "$installed_bundle"
+    mv "$staged_bundle" "$installed_bundle"
+
+    if [ -x "$executable" ]; then
+        "$executable" >/dev/null 2>&1 &
+    else
+        /usr/bin/open "$installed_bundle"
+    fi
+
+    rm -rf "$staging_directory"
+    """
 }
 
 enum ProcessRunner {

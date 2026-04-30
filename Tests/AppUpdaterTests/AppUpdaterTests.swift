@@ -5,7 +5,6 @@ import XCTest
 final class AppUpdaterTests: XCTestCase {
     @MainActor
     func testCheckUpdatesSelectedAsset() async throws {
-        let recorder = UpdateRecorder()
         let releases = try [
             release("2.0.0", prerelease: false, assetName: "AppUpdater-2.0.0.zip"),
         ]
@@ -14,13 +13,12 @@ final class AppUpdaterTests: XCTestCase {
             repo: "AppUpdater",
             currentVersion: { Version(1, 0, 0) },
             fetchReleases: { releases },
-            updateAsset: { asset in await recorder.record(asset.name) }
+            stageAsset: { asset in stagedUpdate(assetName: asset.name) }
         )
 
-        try await updater.check()
+        let update = try await updater.check()
 
-        let names = await recorder.names()
-        XCTAssertEqual(names, ["AppUpdater-2.0.0.zip"])
+        XCTAssertEqual(update?.assetName, "AppUpdater-2.0.0.zip")
     }
 
     @MainActor
@@ -31,11 +29,14 @@ final class AppUpdaterTests: XCTestCase {
             hasExecutable: { false },
             currentVersion: { Version(1, 0, 0) },
             fetchReleases: { [] },
-            updateAsset: { _ in XCTFail("update should not run") }
+            stageAsset: { _ in
+                XCTFail("update should not run")
+                return stagedUpdate()
+            }
         )
 
         do {
-            try await updater.check()
+            _ = try await updater.check()
             XCTFail("check should throw")
         } catch {
             XCTAssertEqual(error as? AppUpdaterError, .bundleExecutableURL)
@@ -44,7 +45,6 @@ final class AppUpdaterTests: XCTestCase {
 
     @MainActor
     func testCheckDoesNotUpdateWithoutMatchingAsset() async throws {
-        let recorder = UpdateRecorder()
         let releases = try [
             release("2.0.0", prerelease: false, assetName: "OtherApp-2.0.0.zip"),
         ]
@@ -53,18 +53,19 @@ final class AppUpdaterTests: XCTestCase {
             repo: "AppUpdater",
             currentVersion: { Version(1, 0, 0) },
             fetchReleases: { releases },
-            updateAsset: { asset in await recorder.record(asset.name) }
+            stageAsset: { _ in
+                XCTFail("update should not run")
+                return stagedUpdate()
+            }
         )
 
-        try await updater.check()
+        let update = try await updater.check()
 
-        let names = await recorder.names()
-        XCTAssertEqual(names, [])
+        XCTAssertNil(update)
     }
 
     @MainActor
     func testCheckRespectsPrereleaseOptIn() async throws {
-        let recorder = UpdateRecorder()
         let releases = try [
             release("2.0.0-beta.1", prerelease: true, assetName: "AppUpdater-2.0.0-beta.1.zip"),
         ]
@@ -73,14 +74,13 @@ final class AppUpdaterTests: XCTestCase {
             repo: "AppUpdater",
             currentVersion: { Version(1, 0, 0) },
             fetchReleases: { releases },
-            updateAsset: { asset in await recorder.record(asset.name) }
+            stageAsset: { asset in stagedUpdate(assetName: asset.name) }
         )
         updater.allowPrereleases = true
 
-        try await updater.check()
+        let update = try await updater.check()
 
-        let names = await recorder.names()
-        XCTAssertEqual(names, ["AppUpdater-2.0.0-beta.1.zip"])
+        XCTAssertEqual(update?.assetName, "AppUpdater-2.0.0-beta.1.zip")
     }
 
     func testReleaseDecodingAcceptsSupportedContentTypes() throws {
@@ -184,20 +184,18 @@ final class AppUpdaterTests: XCTestCase {
         XCTAssertEqual(asset?.name, "AppUpdater-1.9.0.zip")
     }
 
-    func testFindViableUpdateThrowsWhenAlreadyCurrent() throws {
+    func testFindViableUpdateReturnsNilWhenAlreadyCurrent() throws {
         let releases = try [
             release("1.9.0", prerelease: false, assetName: "AppUpdater-1.9.0.zip"),
         ]
 
-        XCTAssertThrowsError(
-            try releases.findViableUpdate(
-                appVersion: Version(2, 0, 0),
-                repo: "AppUpdater",
-                prerelease: false
-            )
-        ) { error in
-            XCTAssertEqual(error as? AppUpdaterError, .noUpdateAvailable)
-        }
+        let asset = try releases.findViableUpdate(
+            appVersion: Version(2, 0, 0),
+            repo: "AppUpdater",
+            prerelease: false
+        )
+
+        XCTAssertNil(asset)
     }
 
     func testFindViableUpdateReturnsNilWhenNoReleasesExist() throws {
@@ -311,6 +309,24 @@ final class AppUpdaterTests: XCTestCase {
         }
     }
 
+    func testInstallerHelperWritesExecutableArgumentDrivenScript() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let scriptURL = try InstallerHelper.writeScript(in: root)
+        let script = try String(contentsOf: scriptURL, encoding: .utf8)
+        let permissions = try FileManager.default.attributesOfItem(
+            atPath: scriptURL.path
+        )[.posixPermissions] as? Int
+
+        XCTAssertTrue(script.hasPrefix("#!/bin/sh"))
+        XCTAssertTrue(script.contains("staged_bundle=\"$2\""))
+        XCTAssertTrue(script.contains("installed_bundle=\"$3\""))
+        XCTAssertTrue(script.contains("executable=\"$4\""))
+        XCTAssertTrue(script.contains("deadline=$(( $(date +%s) + 300 ))"))
+        XCTAssertEqual(permissions, 0o700)
+    }
+
     private func release(
         _ version: String,
         prerelease: Bool,
@@ -341,14 +357,12 @@ final class AppUpdaterTests: XCTestCase {
     }
 }
 
-private actor UpdateRecorder {
-    private var recordedNames: [String] = []
-
-    func names() -> [String] {
-        recordedNames
-    }
-
-    func record(_ name: String) {
-        recordedNames.append(name)
-    }
+private func stagedUpdate(assetName: String = "AppUpdater-2.0.0.zip") -> Update {
+    Update(
+        assetName: assetName,
+        stagedBundleURL: URL(fileURLWithPath: "/tmp/staged/AppUpdater.app"),
+        installedBundleURL: URL(fileURLWithPath: "/Applications/AppUpdater.app"),
+        executableURL: URL(fileURLWithPath: "/Applications/AppUpdater.app/Contents/MacOS/AppUpdater"),
+        stagingDirectoryURL: URL(fileURLWithPath: "/tmp/staged")
+    )
 }
