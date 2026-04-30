@@ -271,6 +271,23 @@ struct Release: Decodable, Comparable {
             case browserDownloadURL = "browser_download_url"
             case contentType = "content_type"
         }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            name = try container.decode(String.self, forKey: .name)
+            browserDownloadURL = try container.decode(
+                URL.self,
+                forKey: .browserDownloadURL
+            )
+            let rawContentType = try container.decode(
+                String.self,
+                forKey: .contentType
+            )
+            contentType = try ContentType(
+                rawValue: rawContentType,
+                assetName: name
+            )
+        }
     }
 
     func viableAsset(forRepo repo: String) -> Asset? {
@@ -298,14 +315,26 @@ struct Release: Decodable, Comparable {
 enum ContentType: Decodable, Equatable {
     case zip
     case tar
+    case dmg
 
     init(from decoder: Decoder) throws {
         let rawValue = try decoder.singleValueContainer().decode(String.self)
+        try self.init(rawValue: rawValue, assetName: nil)
+    }
+
+    init(rawValue: String, assetName: String?) throws {
         switch rawValue {
         case "application/x-bzip2", "application/x-xz", "application/x-gzip":
             self = .tar
         case "application/zip":
             self = .zip
+        case "application/x-apple-diskimage":
+            self = .dmg
+        case let value where [
+            "application/octet-stream",
+            "binary/octet-stream",
+        ].contains(value) && assetName?.lowercased().hasSuffix(".dmg") == true:
+            self = .dmg
         default:
             throw AppUpdaterError.unsupportedContentType(rawValue)
         }
@@ -337,9 +366,6 @@ enum ArchiveExtractor {
         contentType: ContentType,
         into directory: URL
     ) async throws -> URL {
-        let entries = try await entries(in: url, contentType: contentType)
-        try validate(entries: entries)
-
         let extractionDirectory = directory.appendingPathComponent(
             "extracted",
             isDirectory: true
@@ -350,12 +376,18 @@ enum ArchiveExtractor {
         )
 
         switch contentType {
+        case .dmg:
+            return try await extractDiskImage(url, into: extractionDirectory)
         case .tar:
+            let entries = try await entries(in: url, contentType: contentType)
+            try validate(entries: entries)
             _ = try await ProcessRunner.run(
                 URL(fileURLWithPath: "/usr/bin/tar"),
                 arguments: ["-xf", url.path, "-C", extractionDirectory.path]
             )
         case .zip:
+            let entries = try await entries(in: url, contentType: contentType)
+            try validate(entries: entries)
             _ = try await ProcessRunner.run(
                 URL(fileURLWithPath: "/usr/bin/ditto"),
                 arguments: ["-x", "-k", url.path, extractionDirectory.path]
@@ -386,6 +418,8 @@ enum ArchiveExtractor {
         contentType: ContentType
     ) async throws -> [String] {
         switch contentType {
+        case .dmg:
+            throw AppUpdaterError.unsupportedContentType("application/x-apple-diskimage")
         case .tar:
             let output = try await ProcessRunner.run(
                 URL(fileURLWithPath: "/usr/bin/tar"),
@@ -399,6 +433,81 @@ enum ArchiveExtractor {
             )
             return output.stdout.lines
         }
+    }
+
+    private static func extractDiskImage(
+        _ url: URL,
+        into extractionDirectory: URL
+    ) async throws -> URL {
+        let mountDirectory = extractionDirectory
+            .deletingLastPathComponent()
+            .appendingPathComponent("mounted", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: mountDirectory,
+            withIntermediateDirectories: true
+        )
+
+        let mountPoint = try await attachDiskImage(url, at: mountDirectory)
+        do {
+            let app = try findSingleApp(in: mountPoint)
+            let destination = extractionDirectory.appendingPathComponent(
+                app.lastPathComponent,
+                isDirectory: true
+            )
+            try FileManager.default.copyItem(at: app, to: destination)
+            try await detachDiskImage(at: mountPoint)
+            return try findSingleApp(in: extractionDirectory)
+        } catch {
+            try? await detachDiskImage(at: mountPoint)
+            throw error
+        }
+    }
+
+    private static func attachDiskImage(
+        _ url: URL,
+        at mountPoint: URL
+    ) async throws -> URL {
+        let output = try await ProcessRunner.run(
+            URL(fileURLWithPath: "/usr/bin/hdiutil"),
+            arguments: [
+                "attach",
+                "-plist",
+                "-nobrowse",
+                "-readonly",
+                "-mountpoint",
+                mountPoint.path,
+                url.path,
+            ]
+        )
+        return diskImageMountPoint(from: output.stdout) ?? mountPoint
+    }
+
+    private static func detachDiskImage(at mountPoint: URL) async throws {
+        _ = try await ProcessRunner.run(
+            URL(fileURLWithPath: "/usr/bin/hdiutil"),
+            arguments: ["detach", mountPoint.path]
+        )
+    }
+
+    private static func diskImageMountPoint(from plist: String) -> URL? {
+        let data = Data(plist.utf8)
+        let decoded = try? PropertyListSerialization.propertyList(
+            from: data,
+            options: [],
+            format: nil
+        )
+        guard let root = decoded as? [String: Any],
+              let entities = root["system-entities"] as? [[String: Any]]
+        else {
+            return nil
+        }
+
+        for entity in entities {
+            if let path = entity["mount-point"] as? String {
+                return URL(fileURLWithPath: path, isDirectory: true)
+            }
+        }
+        return nil
     }
 
     private static func findSingleApp(in directory: URL) throws -> URL {

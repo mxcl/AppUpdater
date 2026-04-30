@@ -228,7 +228,7 @@ final class AppUpdaterTests: XCTestCase {
         XCTAssertEqual(release.tagName, Version(2, 1, 3))
     }
 
-    func testReleaseDecodingRejectsUnsupportedContentTypes() {
+    func testReleaseDecodingAcceptsDiskImageContentType() throws {
         let json = """
         {
           "tag_name": "2.0.0",
@@ -238,6 +238,50 @@ final class AppUpdaterTests: XCTestCase {
               "name": "AppUpdater-2.0.0.dmg",
               "browser_download_url": "https://example.com/AppUpdater.dmg",
               "content_type": "application/x-apple-diskimage"
+            }
+          ]
+        }
+        """.data(using: .utf8)!
+
+        let release = try JSONDecoder().decode(Release.self, from: json)
+
+        XCTAssertEqual(release.assets.first?.contentType, .dmg)
+        XCTAssertEqual(
+            release.viableAsset(forRepo: "AppUpdater")?.name,
+            "AppUpdater-2.0.0.dmg"
+        )
+    }
+
+    func testReleaseDecodingAcceptsGenericDiskImageContentType() throws {
+        let json = """
+        {
+          "tag_name": "2.0.0",
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "AppUpdater-2.0.0.dmg",
+              "browser_download_url": "https://example.com/AppUpdater.dmg",
+              "content_type": "application/octet-stream"
+            }
+          ]
+        }
+        """.data(using: .utf8)!
+
+        let release = try JSONDecoder().decode(Release.self, from: json)
+
+        XCTAssertEqual(release.assets.first?.contentType, .dmg)
+    }
+
+    func testReleaseDecodingRejectsUnsupportedContentTypes() {
+        let json = """
+        {
+          "tag_name": "2.0.0",
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "AppUpdater-2.0.0.pkg",
+              "browser_download_url": "https://example.com/AppUpdater.pkg",
+              "content_type": "application/octet-stream"
             }
           ]
         }
@@ -299,6 +343,26 @@ final class AppUpdaterTests: XCTestCase {
         )
 
         XCTAssertEqual(asset?.name, "AppUpdater-2.0.0-beta.1.zip")
+    }
+
+    func testFindViableUpdateCanSelectDiskImage() throws {
+        let releases = try [
+            release(
+                "2.0.0",
+                prerelease: false,
+                assetName: "AppUpdater-2.0.0.dmg",
+                contentType: "application/x-apple-diskimage"
+            ),
+        ]
+
+        let asset = try releases.findViableUpdate(
+            appVersion: Version(1, 0, 0),
+            repo: "AppUpdater",
+            prerelease: false
+        )
+
+        XCTAssertEqual(asset?.name, "AppUpdater-2.0.0.dmg")
+        XCTAssertEqual(asset?.contentType, .dmg)
     }
 
     func testFindViableUpdateSkipsReleasesWithoutMatchingAssets() throws {
@@ -431,6 +495,82 @@ final class AppUpdaterTests: XCTestCase {
         )
 
         XCTAssertEqual(extractedApp.lastPathComponent, "AppUpdater.app")
+    }
+
+    func testArchiveExtractorExtractsDiskImageWithSingleApp() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let source = root.appendingPathComponent("source", isDirectory: true)
+        try makeApp(named: "AppUpdater.app", in: source)
+        let diskImage = try await makeDiskImage(from: source, in: root)
+
+        do {
+            let extractedApp = try await ArchiveExtractor.extract(
+                diskImage,
+                contentType: .dmg,
+                into: root
+            )
+
+            XCTAssertEqual(extractedApp.lastPathComponent, "AppUpdater.app")
+        } catch AppUpdaterError.processFailed(let executable, _, let stderr)
+            where executable.lastPathComponent == "hdiutil"
+        {
+            throw XCTSkip("hdiutil could not attach disk image: \(stderr)")
+        }
+    }
+
+    func testArchiveExtractorRejectsDiskImageWithoutApp() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let source = root.appendingPathComponent("source", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: source,
+            withIntermediateDirectories: true
+        )
+        try Data("hello".utf8).write(to: source.appendingPathComponent("README"))
+        let diskImage = try await makeDiskImage(from: source, in: root)
+
+        do {
+            _ = try await ArchiveExtractor.extract(
+                diskImage,
+                contentType: .dmg,
+                into: root
+            )
+            XCTFail("extract should throw")
+        } catch AppUpdaterError.processFailed(let executable, _, let stderr)
+            where executable.lastPathComponent == "hdiutil"
+        {
+            throw XCTSkip("hdiutil could not attach disk image: \(stderr)")
+        } catch {
+            XCTAssertEqual(error as? AppUpdaterError, .invalidDownloadedBundle)
+        }
+    }
+
+    func testArchiveExtractorRejectsDiskImageWithMultipleApps() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let source = root.appendingPathComponent("source", isDirectory: true)
+        try makeApp(named: "One.app", in: source)
+        try makeApp(named: "Two.app", in: source)
+        let diskImage = try await makeDiskImage(from: source, in: root)
+
+        do {
+            _ = try await ArchiveExtractor.extract(
+                diskImage,
+                contentType: .dmg,
+                into: root
+            )
+            XCTFail("extract should throw")
+        } catch AppUpdaterError.processFailed(let executable, _, let stderr)
+            where executable.lastPathComponent == "hdiutil"
+        {
+            throw XCTSkip("hdiutil could not attach disk image: \(stderr)")
+        } catch {
+            XCTAssertEqual(error as? AppUpdaterError, .invalidDownloadedBundle)
+        }
     }
 
     func testArchiveExtractorRejectsArchiveWithoutApp() async throws {
@@ -612,7 +752,8 @@ final class AppUpdaterTests: XCTestCase {
     private func release(
         _ version: String,
         prerelease: Bool,
-        assetName: String
+        assetName: String,
+        contentType: String = "application/zip"
     ) throws -> Release {
         let json = """
         {
@@ -622,7 +763,7 @@ final class AppUpdaterTests: XCTestCase {
             {
               "name": "\(assetName)",
               "browser_download_url": "https://example.com/\(assetName)",
-              "content_type": "application/zip"
+              "content_type": "\(contentType)"
             }
           ]
         }
@@ -636,6 +777,29 @@ final class AppUpdaterTests: XCTestCase {
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
+    }
+
+    private func makeDiskImage(from source: URL, in root: URL) async throws -> URL {
+        let diskImage = root.appendingPathComponent("AppUpdater.dmg")
+        do {
+            _ = try await ProcessRunner.run(
+                URL(fileURLWithPath: "/usr/bin/hdiutil"),
+                arguments: [
+                    "create",
+                    "-quiet",
+                    "-fs",
+                    "HFS+",
+                    "-srcfolder",
+                    source.path,
+                    diskImage.path,
+                ]
+            )
+        } catch AppUpdaterError.processFailed(let executable, _, let stderr)
+            where executable.lastPathComponent == "hdiutil"
+        {
+            throw XCTSkip("hdiutil could not create disk image: \(stderr)")
+        }
+        return diskImage
     }
 
     private func makeApp(named name: String, in directory: URL) throws {
