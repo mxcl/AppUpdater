@@ -19,7 +19,7 @@ asset and stages verified updates for your app to install explicitly.
 * Full semantic versioning support: we understand alpha/beta etc.
 * We check the code-sign identity of the download matches the app that is
     running before doing the update.
-* We support zip files or tarballs.
+* We support zip files, tarballs, or DMGs.
 
 ## Usage
 
