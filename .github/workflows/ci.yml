@@ -17,4 +17,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Test
-        run: swift test
+        run: swift test --enable-code-coverage
+      - name: Export coverage
+        run: |
+          bin_path="$(swift build --show-bin-path)"
+          xctest_path="$bin_path/AppUpdaterPackageTests.xctest"
+          test_binary="$xctest_path/Contents/MacOS/AppUpdaterPackageTests"
+          xcrun llvm-cov export \
+            "$test_binary" \
+            -instr-profile "$bin_path/codecov/default.profdata" \
+            -format=lcov \
+            -ignore-filename-regex='\.build|Tests' \
+            > coverage.lcov
+      - name: Coveralls
+        uses: coverallsapp/github-action@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          file: coverage.lcov
+          format: lcov

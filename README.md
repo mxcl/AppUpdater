@@ -1,12 +1,16 @@
 # AppUpdater
 
+[![Coverage Status][coveralls-badge]][coveralls]
+
 A simple app-updater for macOS that checks your GitHub releases for a binary
-asset and silently updates your app.
+asset and stages verified updates for your app to install explicitly.
+
+[coveralls-badge]: https://coveralls.io/repos/github/mxcl/AppUpdater/badge.svg
+[coveralls]: https://coveralls.io/github/mxcl/AppUpdater
 
 ## Caveats
 
-* We make no allowances for ensuring your app is not being actively used by the
-    user at the time of update. PR welcome.
+* Your app owns the user experience for asking to quit and install an update.
 * Assets must be named: `\(reponame)-\(semanticVersion).ext`.
 * Will not work if App is installed as a root user.
 
@@ -41,7 +45,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @IBAction func userRequestedAnExplicitUpdateCheck() {
         Task {
             do {
-                try await updater.check()
+                guard let update = try await updater.check() else {
+                    return
+                }
+
+                // Ask the user to save work and confirm a relaunch.
+                try await update.installAndRelaunch()
             } catch {
                 // Show an alert for this error.
             }
@@ -50,8 +59,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 }
 ```
 
-`AppUpdater` only checks when you call `check()`. To check daily, own the
-scheduling in your app:
+`check()` downloads and verifies an update, but does not install it. To check
+daily, own the scheduling in your app and decide when to present the staged
+update:
 
 ```swift
 import AppKit
@@ -63,6 +73,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         owner: "your-github-username",
         repo: "your-github-repo-name"
     )
+    var availableUpdate: Update?
 
     lazy var updateActivity: NSBackgroundActivityScheduler = {
         let activity = NSBackgroundActivityScheduler(
@@ -86,9 +97,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             Task { @MainActor in
                 do {
-                    try await self.updater.check()
+                    if let update = try await self.updater.check() {
+                        // Store this or notify the user at an appropriate time.
+                        self.availableUpdate = update
+                    }
                 } catch {
-                    // Log the error, or ignore it for silent background checks.
+                    // Log the error, or ignore it for background checks.
                 }
                 completion(.finished)
             }
