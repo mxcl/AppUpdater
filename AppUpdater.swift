@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import Security
 import Version
 
 @MainActor
@@ -144,7 +145,7 @@ public final class AppUpdater {
             throw AppUpdaterError.invalidDownloadedBundle
         }
 
-        try await CodeSignature.requireSameSigner(
+        try CodeSignature.requireSameSigner(
             current: .main,
             candidate: downloadedAppBundle
         )
@@ -385,51 +386,61 @@ enum ArchiveExtractor {
     }
 }
 
-struct CodeSignature {
-    let identifier: String
-    let teamIdentifier: String
+enum CodeSignature {
+    static func requireSameSigner(current: Bundle, candidate: Bundle) throws {
+        let currentCode = try staticCode(for: current)
+        let candidateCode = try staticCode(for: candidate)
 
-    static func requireSameSigner(current: Bundle, candidate: Bundle) async throws {
-        async let currentInfo = info(for: current)
-        async let candidateInfo = info(for: candidate)
+        try checkValidity(of: currentCode, requirement: nil)
 
-        guard try await currentInfo == candidateInfo else {
+        var requirement: SecRequirement?
+        let status = SecCodeCopyDesignatedRequirement(
+            currentCode,
+            SecCSFlags(),
+            &requirement
+        )
+        guard status == errSecSuccess, let requirement else {
+            throw AppUpdaterError.missingCodeSigningInfo
+        }
+
+        try checkValidity(of: candidateCode, requirement: requirement)
+    }
+
+    private static func staticCode(for bundle: Bundle) throws -> SecStaticCode {
+        var staticCode: SecStaticCode?
+        let status = SecStaticCodeCreateWithPath(
+            bundle.bundleURL as CFURL,
+            SecCSFlags(),
+            &staticCode
+        )
+        guard status == errSecSuccess, let staticCode else {
+            throw AppUpdaterError.missingCodeSigningInfo
+        }
+        return staticCode
+    }
+
+    private static func checkValidity(
+        of staticCode: SecStaticCode,
+        requirement: SecRequirement?
+    ) throws {
+        let flags = SecCSFlags(
+            rawValue: kSecCSStrictValidate
+                | kSecCSCheckAllArchitectures
+                | kSecCSCheckNestedCode
+        )
+        var error: Unmanaged<CFError>?
+        let status = SecStaticCodeCheckValidityWithErrors(
+            staticCode,
+            flags,
+            requirement,
+            &error
+        )
+        guard status == errSecSuccess else {
+            _ = error?.takeRetainedValue()
             throw AppUpdaterError.mismatchedCodeSigningInfo
         }
     }
-
-    static func info(for bundle: Bundle) async throws -> CodeSignature {
-        _ = try await ProcessRunner.run(
-            URL(fileURLWithPath: "/usr/bin/codesign"),
-            arguments: ["--verify", "--deep", "--strict", bundle.bundlePath]
-        )
-        let output = try await ProcessRunner.run(
-            URL(fileURLWithPath: "/usr/bin/codesign"),
-            arguments: ["-dvvv", bundle.bundlePath]
-        )
-
-        let fields = Dictionary<String, String>(
-            uniqueKeysWithValues: output.stderr.lines.compactMap { line -> (String, String)? in
-                let parts = line.split(separator: "=", maxSplits: 1)
-                guard parts.count == 2 else { return nil }
-                return (String(parts[0]), String(parts[1]))
-            }
-        )
-        guard let identifier = fields["Identifier"],
-              let teamIdentifier = fields["TeamIdentifier"],
-              !identifier.isEmpty,
-              !teamIdentifier.isEmpty
-        else {
-            throw AppUpdaterError.missingCodeSigningInfo
-        }
-        return CodeSignature(
-            identifier: identifier,
-            teamIdentifier: teamIdentifier
-        )
-    }
 }
-
-extension CodeSignature: Equatable {}
 
 enum ProcessRunner {
     struct Output {
