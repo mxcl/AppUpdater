@@ -4,6 +4,13 @@ import XCTest
 
 final class AppUpdaterTests: XCTestCase {
     @MainActor
+    func testPublicInitializerCreatesUpdater() {
+        let updater = AppUpdater(owner: "mxcl", repo: "AppUpdater")
+
+        XCTAssertFalse(updater.allowPrereleases)
+    }
+
+    @MainActor
     func testCheckUpdatesSelectedAsset() async throws {
         let releases = try [
             release("2.0.0", prerelease: false, assetName: "AppUpdater-2.0.0.zip"),
@@ -83,6 +90,39 @@ final class AppUpdaterTests: XCTestCase {
         XCTAssertEqual(update?.assetName, "AppUpdater-2.0.0-beta.1.zip")
     }
 
+    @MainActor
+    func testCheckReusesActiveTask() async throws {
+        let gate = AsyncGate()
+        let release = try release(
+            "2.0.0",
+            prerelease: false,
+            assetName: "AppUpdater-2.0.0.zip"
+        )
+        let updater = AppUpdater(
+            owner: "mxcl",
+            repo: "AppUpdater",
+            currentVersion: { Version(1, 0, 0) },
+            fetchReleases: {
+                await gate.wait()
+                return [release]
+            },
+            stageAsset: { asset in stagedUpdate(assetName: asset.name) }
+        )
+
+        async let first = updater.check()
+        async let second = updater.check()
+        await gate.waitForWaiters()
+        await gate.open()
+
+        let updates = try await [first, second]
+        XCTAssertEqual(updates.map(\.?.assetName), [
+            "AppUpdater-2.0.0.zip",
+            "AppUpdater-2.0.0.zip",
+        ])
+        let waiterCount = await gate.waitCallCount()
+        XCTAssertEqual(waiterCount, 1)
+    }
+
     func testReleaseDecodingAcceptsSupportedContentTypes() throws {
         let json = """
         {
@@ -136,6 +176,30 @@ final class AppUpdaterTests: XCTestCase {
         """.data(using: .utf8)!
 
         XCTAssertThrowsError(try JSONDecoder().decode(Release.self, from: json))
+    }
+
+    func testReleaseDecodingAcceptsTarContentTypes() throws {
+        let json = """
+        {
+          "tag_name": "2.0.0",
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "AppUpdater-2.0.0.tar.gz",
+              "browser_download_url": "https://example.com/AppUpdater.tar.gz",
+              "content_type": "application/x-gzip"
+            }
+          ]
+        }
+        """.data(using: .utf8)!
+
+        let release = try JSONDecoder().decode(Release.self, from: json)
+
+        XCTAssertEqual(release.assets.first?.contentType, .tar)
+        XCTAssertEqual(
+            release.viableAsset(forRepo: "AppUpdater")?.name,
+            "AppUpdater-2.0.0.tar.gz"
+        )
     }
 
     func testFindViableUpdateSelectsHighestStableRelease() throws {
@@ -309,6 +373,48 @@ final class AppUpdaterTests: XCTestCase {
         }
     }
 
+    func testProcessRunnerThrowsWhenExecutableCannotLaunch() async throws {
+        do {
+            _ = try await ProcessRunner.run(
+                URL(fileURLWithPath: "/tmp/not-a-real-executable"),
+                arguments: []
+            )
+            XCTFail("process should throw")
+        } catch {
+            XCTAssertNotNil(error)
+        }
+    }
+
+    func testErrorDescriptions() {
+        let errors: [AppUpdaterError] = [
+            .bundleExecutableURL,
+            .invalidAppVersion("wat"),
+            .invalidArchiveEntry("../App.app"),
+            .invalidDownloadedBundle,
+            .invalidGitHubResponse,
+            .insecureDownloadURL,
+            .missingCodeSigningInfo,
+            .mismatchedCodeSigningInfo,
+            .processFailed(URL(fileURLWithPath: "/bin/false"), 1, "nope"),
+            .unsupportedContentType("application/octet-stream"),
+        ]
+
+        for error in errors {
+            XCTAssertFalse(error.localizedDescription.isEmpty)
+        }
+    }
+
+    func testAppVersionParsing() throws {
+        XCTAssertEqual(try Version.appVersion(from: "v2.1"), Version(2, 1, 0))
+
+        XCTAssertThrowsError(try Version.appVersion(from: nil)) { error in
+            XCTAssertEqual(error as? AppUpdaterError, .invalidAppVersion(""))
+        }
+        XCTAssertThrowsError(try Version.appVersion(from: "nope")) { error in
+            XCTAssertEqual(error as? AppUpdaterError, .invalidAppVersion("nope"))
+        }
+    }
+
     func testInstallerHelperWritesExecutableArgumentDrivenScript() throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -325,6 +431,39 @@ final class AppUpdaterTests: XCTestCase {
         XCTAssertTrue(script.contains("executable=\"$4\""))
         XCTAssertTrue(script.contains("deadline=$(( $(date +%s) + 300 ))"))
         XCTAssertEqual(permissions, 0o700)
+    }
+
+    @MainActor
+    func testInstallAndRelaunchWritesHelperAndLaunchesIt() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let launcher = LauncherRecorder()
+        let terminator = TerminatorRecorder()
+        let update = Update(
+            assetName: "AppUpdater-2.0.0.zip",
+            stagedBundleURL: root.appendingPathComponent("Staged.app"),
+            installedBundleURL: URL(fileURLWithPath: "/Applications/AppUpdater.app"),
+            executableURL: URL(fileURLWithPath: "/Applications/AppUpdater.app/Contents/MacOS/AppUpdater"),
+            stagingDirectoryURL: root,
+            relauncher: { scriptURL, arguments in
+                launcher.record(scriptURL: scriptURL, arguments: arguments)
+            },
+            terminator: {
+                terminator.record()
+            }
+        )
+
+        try await update.installAndRelaunch()
+
+        let launch = launcher.launch()
+        XCTAssertEqual(launch?.scriptURL.lastPathComponent, "install-update.sh")
+        XCTAssertEqual(launch?.arguments.dropFirst(), [
+            update.stagedBundleURL.path,
+            update.installedBundleURL.path,
+            update.executableURL.path,
+            root.path,
+        ])
+        XCTAssertTrue(terminator.wasCalled())
     }
 
     private func release(
@@ -354,6 +493,68 @@ final class AppUpdaterTests: XCTestCase {
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
+    }
+}
+
+private actor AsyncGate {
+    private var continuations: [CheckedContinuation<Void, Never>] = []
+    private var waiterContinuations: [CheckedContinuation<Void, Never>] = []
+    private var waits = 0
+
+    func waitCallCount() -> Int {
+        waits
+    }
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            waits += 1
+            continuations.append(continuation)
+            waiterContinuations.forEach { $0.resume() }
+            waiterContinuations.removeAll()
+        }
+    }
+
+    func waitForWaiters() async {
+        guard continuations.isEmpty else { return }
+        await withCheckedContinuation { continuation in
+            waiterContinuations.append(continuation)
+        }
+    }
+
+    func open() {
+        let continuations = continuations
+        self.continuations.removeAll()
+        continuations.forEach { $0.resume() }
+    }
+}
+
+private final class LauncherRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recordedLaunch: (scriptURL: URL, arguments: [String])?
+
+    func launch() -> (scriptURL: URL, arguments: [String])? {
+        lock.withLock { recordedLaunch }
+    }
+
+    func record(scriptURL: URL, arguments: [String]) {
+        lock.withLock {
+            recordedLaunch = (scriptURL, arguments)
+        }
+    }
+}
+
+private final class TerminatorRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var called = false
+
+    func wasCalled() -> Bool {
+        lock.withLock { called }
+    }
+
+    func record() {
+        lock.withLock {
+            called = true
+        }
     }
 }
 

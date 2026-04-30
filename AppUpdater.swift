@@ -168,27 +168,47 @@ public final class AppUpdater {
 }
 
 public struct Update: Sendable {
+    typealias Relauncher = @Sendable (URL, [String]) throws -> Void
+    typealias Terminator = @MainActor @Sendable () -> Void
+
     public let assetName: String
     public let stagedBundleURL: URL
     public let installedBundleURL: URL
     public let executableURL: URL
 
     let stagingDirectoryURL: URL
+    let relauncher: Relauncher
+    let terminator: Terminator
 
     @MainActor
     public func installAndRelaunch() async throws {
         let helperURL = try InstallerHelper.writeScript(in: stagingDirectoryURL)
-        let process = Process()
-        process.executableURL = helperURL
-        process.arguments = [
+        try relauncher(helperURL, [
             "\(getpid())",
             stagedBundleURL.path,
             installedBundleURL.path,
             executableURL.path,
             stagingDirectoryURL.path,
-        ]
-        try process.run()
-        NSApp.terminate(nil)
+        ])
+        terminator()
+    }
+
+    init(
+        assetName: String,
+        stagedBundleURL: URL,
+        installedBundleURL: URL,
+        executableURL: URL,
+        stagingDirectoryURL: URL,
+        relauncher: @escaping Relauncher = InstallerHelper.launch,
+        terminator: @escaping Terminator = { NSApp.terminate(nil) }
+    ) {
+        self.assetName = assetName
+        self.stagedBundleURL = stagedBundleURL
+        self.installedBundleURL = installedBundleURL
+        self.executableURL = executableURL
+        self.stagingDirectoryURL = stagingDirectoryURL
+        self.relauncher = relauncher
+        self.terminator = terminator
     }
 }
 
@@ -456,6 +476,13 @@ enum CodeSignature {
 }
 
 enum InstallerHelper {
+    static func launch(scriptURL: URL, arguments: [String]) throws {
+        let process = Process()
+        process.executableURL = scriptURL
+        process.arguments = arguments
+        try process.run()
+    }
+
     static func writeScript(in directory: URL) throws -> URL {
         let scriptURL = directory.appendingPathComponent("install-update.sh")
         try script.write(to: scriptURL, atomically: true, encoding: .utf8)
@@ -551,8 +578,16 @@ enum ProcessRunner {
 private extension Bundle {
     var appVersion: Version {
         get throws {
-            let rawVersion = object(forInfoDictionaryKey: "CFBundleShortVersionString")
-                as? String
+            let rawVersion = object(
+                forInfoDictionaryKey: "CFBundleShortVersionString"
+            ) as? String
+            return try Version.appVersion(from: rawVersion)
+        }
+    }
+}
+
+extension Version {
+    static func appVersion(from rawVersion: String?) throws -> Version {
             guard let rawVersion else {
                 throw AppUpdaterError.invalidAppVersion("")
             }
@@ -560,7 +595,6 @@ private extension Bundle {
                 throw AppUpdaterError.invalidAppVersion(rawVersion)
             }
             return version
-        }
     }
 }
 
