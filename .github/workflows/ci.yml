@@ -21,8 +21,10 @@ jobs:
       - name: Export coverage
         run: |
           bin_path="$(swift build --show-bin-path)"
+          xctest_path="$bin_path/AppUpdaterPackageTests.xctest"
+          test_binary="$xctest_path/Contents/MacOS/AppUpdaterPackageTests"
           xcrun llvm-cov export \
-            "$bin_path/AppUpdaterPackageTests.xctest/Contents/MacOS/AppUpdaterPackageTests" \
+            "$test_binary" \
             -instr-profile "$bin_path/codecov/default.profdata" \
             -format=lcov \
             -ignore-filename-regex='\.build|Tests' \

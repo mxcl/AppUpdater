@@ -10,6 +10,74 @@ final class AppUpdaterTests: XCTestCase {
         XCTAssertFalse(updater.allowPrereleases)
     }
 
+    func testFetchReleasesUsesGitHubAPIAndTolerantVersionDecoding() async throws {
+        let session = URLSession.stubbed(
+            statusCode: 200,
+            body: """
+            [
+              {
+                "tag_name": "v2.1",
+                "prerelease": false,
+                "assets": [
+                  {
+                    "name": "AppUpdater-2.1.0.zip",
+                    "browser_download_url": "https://example.com/app.zip",
+                    "content_type": "application/zip"
+                  }
+                ]
+              }
+            ]
+            """
+        )
+
+        let releases = try await AppUpdater.fetchReleases(
+            owner: "mxcl",
+            repo: "AppUpdater",
+            session: session
+        )
+        let request = try XCTUnwrap(URLProtocolStub.requests.first)
+
+        XCTAssertEqual(
+            request.url?.absoluteString,
+            "https://api.github.com/repos/mxcl/AppUpdater/releases"
+        )
+        XCTAssertEqual(
+            request.value(forHTTPHeaderField: "Accept"),
+            "application/vnd.github+json"
+        )
+        XCTAssertEqual(releases.first?.tagName, Version(2, 1, 0))
+    }
+
+    func testFetchReleasesThrowsForNonSuccessStatus() async throws {
+        let session = URLSession.stubbed(statusCode: 500, body: "[]")
+
+        do {
+            _ = try await AppUpdater.fetchReleases(
+                owner: "mxcl",
+                repo: "AppUpdater",
+                session: session
+            )
+            XCTFail("fetch should throw")
+        } catch {
+            XCTAssertEqual(error as? AppUpdaterError, .invalidGitHubResponse)
+        }
+    }
+
+    func testFetchReleasesThrowsForMalformedJSON() async throws {
+        let session = URLSession.stubbed(statusCode: 200, body: "{")
+
+        do {
+            _ = try await AppUpdater.fetchReleases(
+                owner: "mxcl",
+                repo: "AppUpdater",
+                session: session
+            )
+            XCTFail("fetch should throw")
+        } catch {
+            XCTAssertTrue(error is DecodingError)
+        }
+    }
+
     @MainActor
     func testCheckUpdatesSelectedAsset() async throws {
         let releases = try [
@@ -315,17 +383,7 @@ final class AppUpdaterTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
 
         let source = root.appendingPathComponent("source", isDirectory: true)
-        let app = source.appendingPathComponent("AppUpdater.app", isDirectory: true)
-        let executableDirectory = app
-            .appendingPathComponent("Contents", isDirectory: true)
-            .appendingPathComponent("MacOS", isDirectory: true)
-        try FileManager.default.createDirectory(
-            at: executableDirectory,
-            withIntermediateDirectories: true
-        )
-        try Data().write(
-            to: executableDirectory.appendingPathComponent("AppUpdater")
-        )
+        try makeApp(named: "AppUpdater.app", in: source)
 
         let archive = root.appendingPathComponent("AppUpdater.zip")
         _ = try await ProcessRunner.run(
@@ -345,6 +403,91 @@ final class AppUpdaterTests: XCTestCase {
         )
 
         XCTAssertEqual(extractedApp.lastPathComponent, "AppUpdater.app")
+    }
+
+    func testArchiveExtractorExtractsTarWithSingleApp() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let source = root.appendingPathComponent("source", isDirectory: true)
+        try makeApp(named: "AppUpdater.app", in: source)
+
+        let archive = root.appendingPathComponent("AppUpdater.tar.gz")
+        _ = try await ProcessRunner.run(
+            URL(fileURLWithPath: "/usr/bin/tar"),
+            arguments: [
+                "-czf",
+                archive.path,
+                "-C",
+                source.path,
+                "AppUpdater.app",
+            ]
+        )
+
+        let extractedApp = try await ArchiveExtractor.extract(
+            archive,
+            contentType: .tar,
+            into: root
+        )
+
+        XCTAssertEqual(extractedApp.lastPathComponent, "AppUpdater.app")
+    }
+
+    func testArchiveExtractorRejectsArchiveWithoutApp() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let source = root.appendingPathComponent("source", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: source,
+            withIntermediateDirectories: true
+        )
+        try Data("hello".utf8).write(to: source.appendingPathComponent("README"))
+
+        let archive = root.appendingPathComponent("NoApp.zip")
+        _ = try await ProcessRunner.run(
+            URL(fileURLWithPath: "/usr/bin/zip"),
+            arguments: ["-qry", archive.path, "README"],
+            currentDirectory: source
+        )
+
+        do {
+            _ = try await ArchiveExtractor.extract(
+                archive,
+                contentType: .zip,
+                into: root
+            )
+            XCTFail("extract should throw")
+        } catch {
+            XCTAssertEqual(error as? AppUpdaterError, .invalidDownloadedBundle)
+        }
+    }
+
+    func testArchiveExtractorRejectsArchiveWithMultipleApps() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let source = root.appendingPathComponent("source", isDirectory: true)
+        try makeApp(named: "One.app", in: source)
+        try makeApp(named: "Two.app", in: source)
+
+        let archive = root.appendingPathComponent("MultipleApps.zip")
+        _ = try await ProcessRunner.run(
+            URL(fileURLWithPath: "/usr/bin/zip"),
+            arguments: ["-qry", archive.path, "One.app", "Two.app"],
+            currentDirectory: source
+        )
+
+        do {
+            _ = try await ArchiveExtractor.extract(
+                archive,
+                contentType: .zip,
+                into: root
+            )
+            XCTFail("extract should throw")
+        } catch {
+            XCTAssertEqual(error as? AppUpdaterError, .invalidDownloadedBundle)
+        }
     }
 
     func testProcessRunnerCapturesStdout() async throws {
@@ -494,6 +637,18 @@ final class AppUpdaterTests: XCTestCase {
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
     }
+
+    private func makeApp(named name: String, in directory: URL) throws {
+        let app = directory.appendingPathComponent(name, isDirectory: true)
+        let executableDirectory = app
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("MacOS", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: executableDirectory,
+            withIntermediateDirectories: true
+        )
+        try Data().write(to: executableDirectory.appendingPathComponent(name))
+    }
 }
 
 private actor AsyncGate {
@@ -555,6 +710,55 @@ private final class TerminatorRecorder: @unchecked Sendable {
         lock.withLock {
             called = true
         }
+    }
+}
+
+private final class URLProtocolStub: URLProtocol, @unchecked Sendable {
+    private nonisolated(unsafe) static var body = Data()
+    private nonisolated(unsafe) static var recordedRequests: [URLRequest] = []
+
+    static var requests: [URLRequest] {
+        recordedRequests
+    }
+
+    static func configure(statusCode: Int, body: String) {
+        self.body = Data(body.utf8)
+        recordedRequests = []
+        self.statusCode = statusCode
+    }
+
+    private nonisolated(unsafe) static var statusCode = 200
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        true
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        Self.recordedRequests.append(request)
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: Self.statusCode,
+            httpVersion: nil,
+            headerFields: nil
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Self.body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+private extension URLSession {
+    static func stubbed(statusCode: Int, body: String) -> URLSession {
+        URLProtocolStub.configure(statusCode: statusCode, body: body)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [URLProtocolStub.self]
+        return URLSession(configuration: configuration)
     }
 }
 

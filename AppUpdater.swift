@@ -90,7 +90,7 @@ public final class AppUpdater {
         return try await task.value
     }
 
-    private static func fetchReleases(
+    static func fetchReleases(
         owner: String,
         repo: String,
         session: URLSession
