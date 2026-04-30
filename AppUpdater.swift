@@ -12,6 +12,10 @@ public final class AppUpdater {
     private let owner: String
     private let repo: String
     private let session: URLSession
+    private let hasExecutable: @Sendable () -> Bool
+    private let currentVersion: @Sendable () throws -> Version
+    private let fetchReleases: @Sendable () async throws -> [Release]
+    private let updateAsset: @Sendable (Release.Asset) async throws -> Void
 
     public var allowPrereleases = false
 
@@ -23,10 +27,56 @@ public final class AppUpdater {
         self.owner = owner
         self.repo = repo
         self.session = session
+        hasExecutable = { Bundle.main.executableURL != nil }
+        currentVersion = { try Bundle.main.appVersion }
+        fetchReleases = {
+            try await Self.fetchReleases(
+                owner: owner,
+                repo: repo,
+                session: session
+            )
+        }
+        updateAsset = { asset in
+            try await Self.update(with: asset, session: session)
+        }
 #if !DEBUG
-        activity = NSBackgroundActivityScheduler(identifier: "dev.mxcl.AppUpdater")
+        activity = Self.scheduleActivity()
+#endif
+        scheduleDailyChecks()
+    }
+
+    init(
+        owner: String,
+        repo: String,
+        hasExecutable: @escaping @Sendable () -> Bool = { true },
+        currentVersion: @escaping @Sendable () throws -> Version,
+        fetchReleases: @escaping @Sendable () async throws -> [Release],
+        updateAsset: @escaping @Sendable (Release.Asset) async throws -> Void
+    ) {
+        self.owner = owner
+        self.repo = repo
+        self.session = .shared
+        self.hasExecutable = hasExecutable
+        self.currentVersion = currentVersion
+        self.fetchReleases = fetchReleases
+        self.updateAsset = updateAsset
+#if !DEBUG
+        activity = Self.scheduleActivity()
+#endif
+        scheduleDailyChecks()
+    }
+
+#if !DEBUG
+    private static func scheduleActivity() -> NSBackgroundActivityScheduler {
+        let activity = NSBackgroundActivityScheduler(identifier: "dev.mxcl.AppUpdater")
         activity.repeats = true
         activity.interval = 24 * 60 * 60
+        return activity
+    }
+#endif
+
+    private func scheduleDailyChecks() {
+#if !DEBUG
         activity.schedule { [weak self] completion in
             Task { @MainActor in
                 guard let self else {
@@ -61,31 +111,29 @@ public final class AppUpdater {
             return try await active.value
         }
 
-        let owner = owner
         let repo = repo
-        let session = session
         let allowPrereleases = allowPrereleases
+        let hasExecutable = hasExecutable
+        let currentVersion = currentVersion
+        let fetchReleases = fetchReleases
+        let updateAsset = updateAsset
 
         let task = Task {
-            guard Bundle.main.executableURL != nil else {
+            guard hasExecutable() else {
                 throw AppUpdaterError.bundleExecutableURL
             }
 
-            let currentVersion = try Bundle.main.appVersion
-            let releases = try await Self.fetchReleases(
-                owner: owner,
-                repo: repo,
-                session: session
-            )
+            let appVersion = try currentVersion()
+            let releases = try await fetchReleases()
             guard let asset = try releases.findViableUpdate(
-                appVersion: currentVersion,
+                appVersion: appVersion,
                 repo: repo,
                 prerelease: allowPrereleases
             ) else {
                 return
             }
 
-            try await Self.update(with: asset, session: session)
+            try await updateAsset(asset)
         }
 
         active = task
@@ -450,7 +498,8 @@ enum ProcessRunner {
 
     static func run(
         _ executableURL: URL,
-        arguments: [String]
+        arguments: [String],
+        currentDirectory: URL? = nil
     ) async throws -> Output {
         try await withCheckedThrowingContinuation { continuation in
             let process = Process()
@@ -459,6 +508,7 @@ enum ProcessRunner {
 
             process.executableURL = executableURL
             process.arguments = arguments
+            process.currentDirectoryURL = currentDirectory
             process.standardOutput = stdout
             process.standardError = stderr
             process.terminationHandler = { process in
