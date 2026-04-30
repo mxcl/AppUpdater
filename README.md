@@ -1,7 +1,12 @@
 # AppUpdater
 
+[![Coverage Status][coveralls-badge]][coveralls]
+
 A simple app-updater for macOS that checks your GitHub releases for a binary
 asset and stages verified updates for your app to install explicitly.
+
+[coveralls-badge]: https://coveralls.io/repos/github/mxcl/AppUpdater/badge.svg
+[coveralls]: https://coveralls.io/github/mxcl/AppUpdater
 
 ## Caveats
 
