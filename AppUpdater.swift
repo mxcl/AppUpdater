@@ -6,9 +6,6 @@ import Version
 @MainActor
 public final class AppUpdater {
     private var active: Task<Void, Swift.Error>?
-#if !DEBUG
-    private let activity: NSBackgroundActivityScheduler
-#endif
     private let owner: String
     private let repo: String
     private let session: URLSession
@@ -39,10 +36,6 @@ public final class AppUpdater {
         updateAsset = { asset in
             try await Self.update(with: asset, session: session)
         }
-#if !DEBUG
-        activity = Self.scheduleActivity()
-#endif
-        scheduleDailyChecks()
     }
 
     init(
@@ -60,51 +53,7 @@ public final class AppUpdater {
         self.currentVersion = currentVersion
         self.fetchReleases = fetchReleases
         self.updateAsset = updateAsset
-#if !DEBUG
-        activity = Self.scheduleActivity()
-#endif
-        scheduleDailyChecks()
     }
-
-#if !DEBUG
-    private static func scheduleActivity() -> NSBackgroundActivityScheduler {
-        let activity = NSBackgroundActivityScheduler(identifier: "dev.mxcl.AppUpdater")
-        activity.repeats = true
-        activity.interval = 24 * 60 * 60
-        return activity
-    }
-#endif
-
-    private func scheduleDailyChecks() {
-#if !DEBUG
-        activity.schedule { [weak self] completion in
-            Task { @MainActor in
-                guard let self else {
-                    completion(.finished)
-                    return
-                }
-                guard !self.activity.shouldDefer, self.active == nil else {
-                    completion(.deferred)
-                    return
-                }
-                do {
-                    try await self.check()
-                    completion(.finished)
-                } catch {
-                    completion(.finished)
-                }
-            }
-        }
-#endif
-    }
-
-#if !DEBUG
-    deinit {
-        MainActor.assumeIsolated {
-            activity.invalidate()
-        }
-    }
-#endif
 
     public func check() async throws {
         if let active {

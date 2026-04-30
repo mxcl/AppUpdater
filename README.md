@@ -1,7 +1,7 @@
 # AppUpdater
 
-A simple app-updater for macOS, checks your GitHub releases for a binary asset
-once a day and silently updates your app.
+A simple app-updater for macOS that checks your GitHub releases for a binary
+asset and silently updates your app.
 
 ## Caveats
 
@@ -13,9 +13,8 @@ once a day and silently updates your app.
 ## Features
 
 * Full semantic versioning support: we understand alpha/beta etc.
-* We check the code-sign identity of the download matches the app that is running
-    before doing the update. Thus if you don’t code-sign I’m not sure what would
-    happen.
+* We check the code-sign identity of the download matches the app that is
+    running before doing the update.
 * We support zip files or tarballs.
 
 ## Usage
@@ -29,6 +28,7 @@ package.dependencies.append(
 Then:
 
 ```swift
+import AppKit
 import AppUpdater
 
 @NSApplicationMain
@@ -38,7 +38,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         repo: "your-github-repo-name"
     )
 
-    // NOTE: this is optional, the updater schedules a daily update check itself.
     @IBAction func userRequestedAnExplicitUpdateCheck() {
         Task {
             do {
@@ -47,6 +46,57 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 // Show an alert for this error.
             }
         }
+    }
+}
+```
+
+`AppUpdater` only checks when you call `check()`. To check daily, own the
+scheduling in your app:
+
+```swift
+import AppKit
+import AppUpdater
+
+@NSApplicationMain
+class AppDelegate: NSObject, NSApplicationDelegate {
+    let updater = AppUpdater(
+        owner: "your-github-username",
+        repo: "your-github-repo-name"
+    )
+
+    lazy var updateActivity: NSBackgroundActivityScheduler = {
+        let activity = NSBackgroundActivityScheduler(
+            identifier: "com.example.MyApp.update-check"
+        )
+        activity.repeats = true
+        activity.interval = 24 * 60 * 60
+        return activity
+    }()
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        updateActivity.schedule { [weak self] completion in
+            guard let self else {
+                completion(.finished)
+                return
+            }
+            guard !self.updateActivity.shouldDefer else {
+                completion(.deferred)
+                return
+            }
+
+            Task { @MainActor in
+                do {
+                    try await self.updater.check()
+                } catch {
+                    // Log the error, or ignore it for silent background checks.
+                }
+                completion(.finished)
+            }
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        self.updateActivity.invalidate()
     }
 }
 ```
