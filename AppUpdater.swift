@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import Version
 
 @MainActor
 public final class AppUpdater {
@@ -107,7 +108,9 @@ public final class AppUpdater {
         else {
             throw AppUpdaterError.invalidGitHubResponse
         }
-        return try JSONDecoder().decode([Release].self, from: data)
+        let decoder = JSONDecoder()
+        decoder.userInfo[.decodingMethod] = DecodingMethod.tolerant
+        return try decoder.decode([Release].self, from: data)
     }
 
     private static func update(with asset: Release.Asset, session: URLSession) async throws {
@@ -214,7 +217,7 @@ enum AppUpdaterError: LocalizedError, Equatable {
 }
 
 struct Release: Decodable, Comparable {
-    let tagName: SemanticVersion
+    let tagName: Version
     let prerelease: Bool
     let assets: [Asset]
 
@@ -277,7 +280,7 @@ enum ContentType: Decodable, Equatable {
 
 extension Array where Element == Release {
     func findViableUpdate(
-        appVersion: SemanticVersion,
+        appVersion: Version,
         repo: String,
         prerelease: Bool
     ) throws -> Release.Asset? {
@@ -291,99 +294,6 @@ extension Array where Element == Release {
             }
         }
         return nil
-    }
-}
-
-struct SemanticVersion: Comparable, CustomStringConvertible, Decodable {
-    let major: Int
-    let minor: Int
-    let patch: Int
-    let prerelease: [Identifier]
-
-    init(_ string: String) throws {
-        let version = string.hasPrefix("v") ? String(string.dropFirst()) : string
-        let parts = version.split(separator: "-", maxSplits: 1).map(String.init)
-        let core = parts[0].split(separator: ".").map(String.init)
-        guard core.count == 3,
-              let major = Int(core[0]),
-              let minor = Int(core[1]),
-              let patch = Int(core[2])
-        else {
-            throw AppUpdaterError.invalidAppVersion(string)
-        }
-
-        self.major = major
-        self.minor = minor
-        self.patch = patch
-        self.prerelease = try parts.dropFirst().first?
-            .split(separator: ".")
-            .map { try Identifier(String($0)) } ?? []
-    }
-
-    init(from decoder: Decoder) throws {
-        try self.init(try decoder.singleValueContainer().decode(String.self))
-    }
-
-    var description: String {
-        let base = "\(major).\(minor).\(patch)"
-        guard !prerelease.isEmpty else { return base }
-        return "\(base)-\(prerelease.map(\.description).joined(separator: "."))"
-    }
-
-    static func < (lhs: SemanticVersion, rhs: SemanticVersion) -> Bool {
-        let lhsCore = [lhs.major, lhs.minor, lhs.patch]
-        let rhsCore = [rhs.major, rhs.minor, rhs.patch]
-        guard lhsCore == rhsCore else {
-            return lhsCore.lexicographicallyPrecedes(rhsCore)
-        }
-        switch (lhs.prerelease.isEmpty, rhs.prerelease.isEmpty) {
-        case (true, true):
-            return false
-        case (true, false):
-            return false
-        case (false, true):
-            return true
-        case (false, false):
-            return lhs.prerelease.lexicographicallyPrecedes(rhs.prerelease)
-        }
-    }
-
-    enum Identifier: Comparable, CustomStringConvertible {
-        case numeric(Int)
-        case alphanumeric(String)
-
-        init(_ string: String) throws {
-            guard !string.isEmpty else {
-                throw AppUpdaterError.invalidAppVersion(string)
-            }
-            if let value = Int(string) {
-                self = .numeric(value)
-            } else {
-                self = .alphanumeric(string)
-            }
-        }
-
-        var description: String {
-            switch self {
-            case .numeric(let value):
-                "\(value)"
-            case .alphanumeric(let value):
-                value
-            }
-        }
-
-        static func < (lhs: Identifier, rhs: Identifier) -> Bool {
-            switch (lhs, rhs) {
-            case (.numeric(let lhs), .numeric(let rhs)):
-                lhs < rhs
-            case (.numeric, .alphanumeric):
-                true
-            case (.alphanumeric, .numeric):
-                false
-            case (.alphanumeric(let lhs), .alphanumeric(let rhs)):
-                lhs < rhs
-            }
-        }
     }
 }
 
@@ -570,14 +480,17 @@ enum ProcessRunner {
 }
 
 private extension Bundle {
-    var appVersion: SemanticVersion {
+    var appVersion: Version {
         get throws {
             let rawVersion = object(forInfoDictionaryKey: "CFBundleShortVersionString")
                 as? String
             guard let rawVersion else {
                 throw AppUpdaterError.invalidAppVersion("")
             }
-            return try SemanticVersion(rawVersion)
+            guard let version = Version(tolerant: rawVersion) else {
+                throw AppUpdaterError.invalidAppVersion(rawVersion)
+            }
+            return version
         }
     }
 }

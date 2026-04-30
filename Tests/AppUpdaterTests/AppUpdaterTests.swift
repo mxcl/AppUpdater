@@ -1,20 +1,8 @@
 @testable import AppUpdater
+import Version
 import XCTest
 
 final class AppUpdaterTests: XCTestCase {
-    func testSemanticVersionOrdersPrereleasesBeforeFinalRelease() throws {
-        let alpha = try SemanticVersion("2.0.0-alpha.1")
-        let beta = try SemanticVersion("2.0.0-beta.1")
-        let release = try SemanticVersion("2.0.0")
-
-        XCTAssertLessThan(alpha, beta)
-        XCTAssertLessThan(beta, release)
-    }
-
-    func testSemanticVersionAcceptsVPrefixedTags() throws {
-        XCTAssertEqual(try SemanticVersion("v2.1.3").description, "2.1.3")
-    }
-
     func testReleaseDecodingAcceptsSupportedContentTypes() throws {
         let json = """
         {
@@ -32,8 +20,24 @@ final class AppUpdaterTests: XCTestCase {
 
         let release = try JSONDecoder().decode(Release.self, from: json)
 
-        XCTAssertEqual(release.tagName, try SemanticVersion("2.0.0"))
+        XCTAssertEqual(release.tagName, Version(2, 0, 0))
         XCTAssertEqual(release.assets.first?.contentType, .zip)
+    }
+
+    func testReleaseDecodingAcceptsVPrefixedTags() throws {
+        let json = """
+        {
+          "tag_name": "v2.1.3",
+          "prerelease": false,
+          "assets": []
+        }
+        """.data(using: .utf8)!
+        let decoder = JSONDecoder()
+        decoder.userInfo[.decodingMethod] = DecodingMethod.tolerant
+
+        let release = try decoder.decode(Release.self, from: json)
+
+        XCTAssertEqual(release.tagName, Version(2, 1, 3))
     }
 
     func testReleaseDecodingRejectsUnsupportedContentTypes() {
@@ -62,7 +66,7 @@ final class AppUpdaterTests: XCTestCase {
         ]
 
         let asset = try releases.findViableUpdate(
-            appVersion: SemanticVersion("1.0.0"),
+            appVersion: Version(1, 0, 0),
             repo: "AppUpdater",
             prerelease: false
         )
@@ -77,7 +81,7 @@ final class AppUpdaterTests: XCTestCase {
         ]
 
         let asset = try releases.findViableUpdate(
-            appVersion: SemanticVersion("1.0.0"),
+            appVersion: Version(1, 0, 0),
             repo: "AppUpdater",
             prerelease: true
         )
@@ -92,7 +96,7 @@ final class AppUpdaterTests: XCTestCase {
         ]
 
         let asset = try releases.findViableUpdate(
-            appVersion: SemanticVersion("1.0.0"),
+            appVersion: Version(1, 0, 0),
             repo: "AppUpdater",
             prerelease: false
         )
@@ -107,7 +111,7 @@ final class AppUpdaterTests: XCTestCase {
 
         XCTAssertThrowsError(
             try releases.findViableUpdate(
-                appVersion: SemanticVersion("2.0.0"),
+                appVersion: Version(2, 0, 0),
                 repo: "AppUpdater",
                 prerelease: false
             )

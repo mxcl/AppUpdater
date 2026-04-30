@@ -9,9 +9,13 @@ let package = Package(
     products: [
         .library(name: "AppUpdater", targets: ["AppUpdater"]),
     ],
+    dependencies: [
+        .package(url: "https://github.com/mxcl/Version", from: "2.2.1"),
+    ],
     targets: [
         .target(
             name: "AppUpdater",
+            dependencies: ["Version"],
             path: ".",
             exclude: ["LICENSE.md", "README.md", "Tests"],
             sources: ["AppUpdater.swift"]
