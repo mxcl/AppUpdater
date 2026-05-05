@@ -406,6 +406,22 @@ final class AppUpdaterTests: XCTestCase {
         XCTAssertNil(asset)
     }
 
+    @MainActor
+    func testStagingDirectoryAvoidsItemReplacementDirectory() throws {
+        let directory = try AppUpdater.stagingDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        var isDirectory: ObjCBool = false
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: directory.path,
+                isDirectory: &isDirectory
+            )
+        )
+        XCTAssertTrue(isDirectory.boolValue)
+        XCTAssertFalse(directory.path.contains("/TemporaryItems/NSIRD_"))
+    }
+
     func testArchiveValidationRejectsAbsolutePaths() {
         XCTAssertThrowsError(
             try ArchiveExtractor.validate(entries: ["/tmp/evil.app/Contents/MacOS/evil"])

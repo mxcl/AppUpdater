@@ -119,12 +119,7 @@ public final class AppUpdater {
             throw AppUpdaterError.insecureDownloadURL
         }
 
-        let tmpdir = try FileManager.default.url(
-            for: .itemReplacementDirectory,
-            in: .userDomainMask,
-            appropriateFor: Bundle.main.bundleURL,
-            create: true
-        )
+        let tmpdir = try Self.stagingDirectory()
 
         let downloadURL = tmpdir.appendingPathComponent("download")
         let (downloadedURL, _) = try await session.download(
@@ -164,6 +159,19 @@ public final class AppUpdater {
             executableURL: finalExecutableURL,
             stagingDirectoryURL: tmpdir
         )
+    }
+
+    static func stagingDirectory() throws -> URL {
+        let baseURL = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        let url = baseURL.appendingPathComponent(
+            "app-updater-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: url,
+            withIntermediateDirectories: false
+        )
+        return url
     }
 }
 
