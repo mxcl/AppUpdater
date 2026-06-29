@@ -624,9 +624,10 @@ enum InstallerHelper {
     prepared_bundle="$(dirname "$staged_bundle")/$installed_name"
     deadline=$(( $(date +%s) + 300 ))
 
+    trap 'rm -rf "$staging_directory"' EXIT
+
     while kill -0 "$pid" 2>/dev/null; do
         if [ "$(date +%s)" -ge "$deadline" ]; then
-            rm -rf "$staging_directory"
             exit 1
         fi
         sleep 0.2
@@ -656,8 +657,6 @@ enum InstallerHelper {
     else
         /usr/bin/open "$installed_bundle"
     fi
-
-    rm -rf "$staging_directory"
     """
 }
 
