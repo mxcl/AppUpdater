@@ -12,7 +12,7 @@ asset and stages verified updates for your app to install explicitly.
 
 * Your app owns the user experience for asking to quit and install an update.
 * Assets must be named: `\(reponame)-\(semanticVersion).ext`.
-* Will not work if App is installed as a root user.
+* Protected install locations may require a Finder authentication prompt.
 
 ## Features
 

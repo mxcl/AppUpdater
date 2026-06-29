@@ -729,7 +729,60 @@ final class AppUpdaterTests: XCTestCase {
         XCTAssertTrue(script.contains("installed_bundle=\"$3\""))
         XCTAssertTrue(script.contains("executable=\"$4\""))
         XCTAssertTrue(script.contains("deadline=$(( $(date +%s) + 300 ))"))
+        XCTAssertTrue(script.contains("if [ -w \"$installed_parent\" ] && { [ ! -e \"$installed_bundle\" ] || [ -w \"$installed_bundle\" ]; }; then"))
+        XCTAssertTrue(script.contains("/usr/bin/osascript - \"$staged_bundle\" \"$installed_parent\""))
+        XCTAssertTrue(script.contains("tell application \"Finder\" to move stagedBundle to destinationFolder with replacing"))
         XCTAssertEqual(permissions, 0o700)
+    }
+
+    func testInstallerHelperInstallsIntoWritableDirectory() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let stagingDirectory = root.appendingPathComponent("staging", isDirectory: true)
+        let installedParent = root.appendingPathComponent("Applications", isDirectory: true)
+        let stagedBundle = stagingDirectory.appendingPathComponent("AppUpdater.app", isDirectory: true)
+        let installedBundle = installedParent.appendingPathComponent("AppUpdater.app", isDirectory: true)
+        let executable = installedBundle
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("MacOS", isDirectory: true)
+            .appendingPathComponent("AppUpdater")
+        let stagedExecutable = stagedBundle
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("MacOS", isDirectory: true)
+            .appendingPathComponent("AppUpdater")
+
+        try FileManager.default.createDirectory(at: stagingDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: installedParent, withIntermediateDirectories: true)
+        try makeApp(named: "AppUpdater.app", in: stagingDirectory)
+        try makeApp(named: "AppUpdater.app", in: installedParent)
+        try "new".write(to: stagedBundle.appendingPathComponent("marker"), atomically: true, encoding: .utf8)
+        try "old".write(to: installedBundle.appendingPathComponent("marker"), atomically: true, encoding: .utf8)
+        try "#!/bin/sh\nexit 0\n".write(to: stagedExecutable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: stagedExecutable.path)
+
+        let finishedProcess = Process()
+        finishedProcess.executableURL = URL(fileURLWithPath: "/usr/bin/true")
+        try finishedProcess.run()
+        finishedProcess.waitUntilExit()
+
+        let scriptURL = try InstallerHelper.writeScript(in: stagingDirectory)
+        _ = try await ProcessRunner.run(
+            scriptURL,
+            arguments: [
+                "\(finishedProcess.processIdentifier)",
+                stagedBundle.path,
+                installedBundle.path,
+                executable.path,
+                stagingDirectory.path,
+            ]
+        )
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stagingDirectory.path))
+        XCTAssertEqual(
+            try String(contentsOf: installedBundle.appendingPathComponent("marker"), encoding: .utf8),
+            "new"
+        )
     }
 
     @MainActor
