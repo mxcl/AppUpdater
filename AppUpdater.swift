@@ -619,26 +619,44 @@ enum InstallerHelper {
     installed_bundle="$3"
     executable="$4"
     staging_directory="$5"
+    installed_name="$(basename "$installed_bundle")"
+    installed_parent="$(dirname "$installed_bundle")"
+    prepared_bundle="$(dirname "$staged_bundle")/$installed_name"
     deadline=$(( $(date +%s) + 300 ))
+
+    trap 'rm -rf "$staging_directory"' EXIT
 
     while kill -0 "$pid" 2>/dev/null; do
         if [ "$(date +%s)" -ge "$deadline" ]; then
-            rm -rf "$staging_directory"
             exit 1
         fi
         sleep 0.2
     done
 
-    rm -rf "$installed_bundle"
-    mv "$staged_bundle" "$installed_bundle"
+    if [ "$staged_bundle" != "$prepared_bundle" ]; then
+        rm -rf "$prepared_bundle"
+        mv "$staged_bundle" "$prepared_bundle"
+        staged_bundle="$prepared_bundle"
+    fi
+
+    if [ -w "$installed_parent" ] && { [ ! -e "$installed_bundle" ] || [ -w "$installed_bundle" ]; }; then
+        rm -rf "$installed_bundle"
+        mv "$staged_bundle" "$installed_bundle"
+    else
+        /usr/bin/osascript - "$staged_bundle" "$installed_parent" <<'APPLESCRIPT'
+    on run argv
+        set stagedBundle to POSIX file (item 1 of argv) as alias
+        set destinationFolder to POSIX file (item 2 of argv) as alias
+        tell application "Finder" to move stagedBundle to destinationFolder with replacing
+    end run
+    APPLESCRIPT
+    fi
 
     if [ -x "$executable" ]; then
         "$executable" >/dev/null 2>&1 &
     else
         /usr/bin/open "$installed_bundle"
     fi
-
-    rm -rf "$staging_directory"
     """
 }
 
