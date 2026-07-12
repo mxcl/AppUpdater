@@ -19,13 +19,14 @@ public final class AppUpdater {
     public init(
         owner: String,
         repo: String,
+        targetBundle: Bundle = .main,
         session: URLSession = .shared
     ) {
         self.owner = owner
         self.repo = repo
         self.session = session
-        hasExecutable = { Bundle.main.executableURL != nil }
-        currentVersion = { try Bundle.main.appVersion }
+        hasExecutable = { targetBundle.executableURL != nil }
+        currentVersion = { try targetBundle.appVersion }
         fetchReleases = {
             try await Self.fetchReleases(
                 owner: owner,
@@ -34,7 +35,11 @@ public final class AppUpdater {
             )
         }
         stageAsset = { asset in
-            try await Self.stageUpdate(with: asset, session: session)
+            try await Self.stageUpdate(
+                with: asset,
+                replacing: targetBundle,
+                session: session
+            )
         }
     }
 
@@ -113,6 +118,7 @@ public final class AppUpdater {
 
     private static func stageUpdate(
         with asset: Release.Asset,
+        replacing installedAppBundle: Bundle,
         session: URLSession
     ) async throws -> Update {
         guard asset.browserDownloadURL.scheme == "https" else {
@@ -137,11 +143,10 @@ public final class AppUpdater {
         }
 
         try CodeSignature.requireSameSigner(
-            current: .main,
+            current: installedAppBundle,
             candidate: downloadedAppBundle
         )
 
-        let installedAppBundle = Bundle.main
         guard let executableURL = downloadedAppBundle.executableURL else {
             throw AppUpdaterError.invalidDownloadedBundle
         }

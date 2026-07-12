@@ -10,6 +10,26 @@ final class AppUpdaterTests: XCTestCase {
         XCTAssertFalse(updater.allowPrereleases)
     }
 
+    @MainActor
+    func testPublicInitializerReadsVersionFromTargetBundle() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let targetBundle = try makeBundle(named: "Target", version: "not-a-version", in: root)
+        let updater = AppUpdater(
+            owner: "mxcl",
+            repo: "AppUpdater",
+            targetBundle: targetBundle,
+            session: .stubbed(statusCode: 200, body: "[]")
+        )
+
+        do {
+            _ = try await updater.check()
+            XCTFail("check should throw")
+        } catch {
+            XCTAssertEqual(error as? AppUpdaterError, .invalidAppVersion("not-a-version"))
+        }
+    }
+
     func testFetchReleasesUsesGitHubAPIAndTolerantVersionDecoding() async throws {
         let session = URLSession.stubbed(
             statusCode: 200,
@@ -881,6 +901,23 @@ final class AppUpdaterTests: XCTestCase {
             withIntermediateDirectories: true
         )
         try Data().write(to: executableDirectory.appendingPathComponent(name))
+    }
+
+    private func makeBundle(named name: String, version: String, in directory: URL) throws -> Bundle {
+        let app = directory.appendingPathComponent("\(name).app", isDirectory: true)
+        let contents = app.appendingPathComponent("Contents", isDirectory: true)
+        let executableDirectory = contents.appendingPathComponent("MacOS", isDirectory: true)
+        try FileManager.default.createDirectory(at: executableDirectory, withIntermediateDirectories: true)
+        try Data().write(to: executableDirectory.appendingPathComponent(name))
+        let info: [String: Any] = [
+            "CFBundleExecutable": name,
+            "CFBundleIdentifier": "dev.mxcl.\(name.lowercased())",
+            "CFBundlePackageType": "APPL",
+            "CFBundleShortVersionString": version,
+        ]
+        let data = try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
+        try data.write(to: contents.appendingPathComponent("Info.plist"))
+        return try XCTUnwrap(Bundle(url: app))
     }
 }
 
