@@ -86,6 +86,14 @@ path, validates the installed copy, and launches a new instance. It restores
 the backup if copying, final validation, or launch fails. The old instance exits
 after the new instance launches.
 
+> [!IMPORTANT]
+> Quiescing must not cause the old instance to exit. In particular, hosts that
+> return `true` from `applicationShouldTerminateAfterLastWindowClosed(_:)`
+> must suppress that behavior during installation. If the host exits while
+> AppUpdater is copying the replacement, the transaction cannot finish or
+> relaunch the app. Let `installAndRelaunch()` terminate the old instance after
+> replacement and validation complete.
+
 ## Configuration
 
 The defaults cap downloads at 2 GiB, mounted regular-file content at 4 GiB, and
