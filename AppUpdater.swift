@@ -321,6 +321,7 @@ public enum AppUpdaterError: LocalizedError, Equatable {
     case operationTimedOut
     case promotionFailed
     case processFailed(URL, Int32, String)
+    case relaunchFailed
     case resourceLimitExceeded(String)
     case rollbackFailed
     case unsafeInstallationState
@@ -359,6 +360,8 @@ public enum AppUpdaterError: LocalizedError, Equatable {
             "The DMG could not be promoted into a safe installation boundary."
         case .processFailed(let executable, let status, let stderr):
             "\(executable.path) failed with status \(status): \(stderr)"
+        case .relaunchFailed:
+            "The updated app did not launch a new application instance."
         case .resourceLimitExceeded(let resource):
             "The update exceeded the configured \(resource) limit."
         case .rollbackFailed:
@@ -1048,26 +1051,49 @@ struct InstallationDriver {
             )
         },
         launch: { url in
-            let configuration = NSWorkspace.OpenConfiguration()
-            configuration.createsNewApplicationInstance = true
-            try await withCheckedThrowingContinuation {
-                (continuation: CheckedContinuation<Void, Error>) in
-                NSWorkspace.shared.openApplication(
-                    at: url,
-                    configuration: configuration
-                ) { application, error in
-                    if let error {
-                        continuation.resume(throwing: error)
-                    } else if application == nil {
-                        continuation.resume(throwing: AppUpdaterError.invalidUpdateState)
-                    } else {
-                        continuation.resume()
-                    }
-                }
-            }
+            try await ApplicationLauncher.launchNewInstance(at: url)
         },
         terminate: { NSApp.terminate(nil) }
     )
+}
+
+@MainActor
+enum ApplicationLauncher {
+    static func launchNewInstance(at url: URL) async throws {
+        guard let identifier = Bundle(url: url)?.bundleIdentifier else {
+            throw AppUpdaterError.invalidDownloadedBundle
+        }
+        try await launchNewInstance(
+            runningProcessIdentifiers: {
+                Set(NSRunningApplication.runningApplications(
+                    withBundleIdentifier: identifier
+                ).map(\.processIdentifier))
+            },
+            forceLaunch: {
+                _ = try await ProcessRunner.run(
+                    URL(fileURLWithPath: "/usr/bin/open"),
+                    arguments: ["-n", url.path],
+                    timeout: 30
+                )
+            },
+            pause: { try await Task.sleep(nanoseconds: 50_000_000) }
+        )
+    }
+
+    static func launchNewInstance(
+        attempts: Int = 200,
+        runningProcessIdentifiers: () -> Set<pid_t>,
+        forceLaunch: () async throws -> Void,
+        pause: () async throws -> Void
+    ) async throws {
+        let existing = runningProcessIdentifiers()
+        try await forceLaunch()
+        for _ in 0..<attempts {
+            if !runningProcessIdentifiers().isSubset(of: existing) { return }
+            try await pause()
+        }
+        throw AppUpdaterError.relaunchFailed
+    }
 }
 
 @MainActor
