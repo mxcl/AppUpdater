@@ -944,6 +944,23 @@ final class AppUpdaterTests: XCTestCase {
     }
 
     @MainActor
+    func testRelaunchNeverAcceptsTheCurrentProcess() async {
+        var samples: [Set<pid_t>] = [[], [41], [41]]
+        do {
+            try await ApplicationLauncher.launchNewInstance(
+                attempts: 2,
+                currentProcessIdentifier: 41,
+                runningProcessIdentifiers: { samples.removeFirst() },
+                forceLaunch: {},
+                pause: {}
+            )
+            XCTFail("the current process should not satisfy relaunch")
+        } catch {
+            XCTAssertEqual(error as? AppUpdaterError, .relaunchFailed)
+        }
+    }
+
+    @MainActor
     func testInstalledValidationFailureRollsBack() async throws {
         var validations = 0
         var events: [String] = []

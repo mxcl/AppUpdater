@@ -1092,11 +1092,12 @@ enum ApplicationLauncher {
 
     static func launchNewInstance(
         attempts: Int = 200,
+        currentProcessIdentifier: pid_t = getpid(),
         runningProcessIdentifiers: () -> Set<pid_t>,
         forceLaunch: () async throws -> Void,
         pause: () async throws -> Void
     ) async throws {
-        let existing = runningProcessIdentifiers()
+        let existing = runningProcessIdentifiers().union([currentProcessIdentifier])
         try await forceLaunch()
         for _ in 0..<attempts {
             if !runningProcessIdentifiers().isSubset(of: existing) { return }
