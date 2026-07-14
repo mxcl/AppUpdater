@@ -122,6 +122,58 @@ final class AppUpdaterTests: XCTestCase {
         }
     }
 
+    func testNetworkTransferRejectsHTTPSDowngradeRedirect() async throws {
+        let delegate = NetworkTransfer.TransferDelegate(maximumBytes: 100)
+        let session = URLSession.shared
+        let task = session.dataTask(
+            with: URL(string: "https://example.com/update.dmg")!
+        )
+        let response = HTTPURLResponse(
+            url: task.originalRequest!.url!,
+            statusCode: 302,
+            httpVersion: nil,
+            headerFields: nil
+        )!
+        let request = URLRequest(
+            url: URL(string: "http://example.com/update.dmg")!
+        )
+        let redirectedRequest = RequestRecorder()
+
+        delegate.urlSession(
+            session,
+            task: task,
+            willPerformHTTPRedirection: response,
+            newRequest: request
+        ) { redirectedRequest.set($0) }
+
+        XCTAssertNil(redirectedRequest.value())
+        XCTAssertEqual(delegate.error, .insecureDownloadURL)
+    }
+
+    func testNetworkDownloadRejectsActualBytesBeyondDeclaredSize() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let destination = root.appendingPathComponent("update.dmg")
+        let session = URLSession.stubbed(statusCode: 200, body: "12345")
+
+        do {
+            try await NetworkTransfer.download(
+                URL(string: "https://example.com/update.dmg")!,
+                with: session,
+                to: destination,
+                maximumBytes: 4,
+                timeout: 10
+            )
+            XCTFail("download should throw")
+        } catch {
+            XCTAssertEqual(
+                error as? AppUpdaterError,
+                .resourceLimitExceeded("download size")
+            )
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+    }
+
     @MainActor
     func testCheckUpdatesSelectedAsset() async throws {
         let releases = try [
@@ -235,16 +287,21 @@ final class AppUpdaterTests: XCTestCase {
         XCTAssertEqual(waiterCount, 1)
     }
 
-    func testReleaseDecodingIgnoresZipAssets() throws {
+    func testReleaseDecodingIgnoresZipAndTarAssets() throws {
         let json = """
         {
           "tag_name": "2.0.0",
           "prerelease": false,
           "assets": [
             {
-              "name": "AppUpdater-2.0.0.dmg",
+              "name": "AppUpdater-2.0.0.zip",
               "browser_download_url": "https://example.com/AppUpdater.zip",
               "content_type": "application/zip"
+            },
+            {
+              "name": "AppUpdater-2.0.0.tar.gz",
+              "browser_download_url": "https://example.com/AppUpdater.tar.gz",
+              "content_type": "application/gzip"
             }
           ]
         }
@@ -253,7 +310,7 @@ final class AppUpdaterTests: XCTestCase {
         let release = try JSONDecoder().decode(Release.self, from: json)
 
         XCTAssertEqual(release.tagName, Version(2, 0, 0))
-        XCTAssertNil(release.assets.first?.contentType)
+        XCTAssertTrue(release.assets.allSatisfy { $0.contentType == nil })
         XCTAssertNil(release.viableAsset(forRepo: "AppUpdater"))
     }
 
@@ -491,6 +548,21 @@ final class AppUpdaterTests: XCTestCase {
         }
     }
 
+    func testMountedContentInspectionEnforcesTimeout() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data().write(to: root.appendingPathComponent("entry"))
+
+        XCTAssertThrowsError(
+            try ArchiveExtractor.inspect(
+                root,
+                limits: .init(.init(timeout: .leastNonzeroMagnitude))
+            )
+        ) { error in
+            XCTAssertEqual(error as? AppUpdaterError, .operationTimedOut)
+        }
+    }
+
     func testArchiveExtractorExtractsDiskImageWithSingleApp() async throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -564,6 +636,52 @@ final class AppUpdaterTests: XCTestCase {
             throw XCTSkip("hdiutil could not attach disk image: \(stderr)")
         } catch {
             XCTAssertEqual(error as? AppUpdaterError, .invalidDownloadedBundle)
+        }
+    }
+
+    func testArchiveExtractorRejectsMisnamedApp() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let source = root.appendingPathComponent("source", isDirectory: true)
+        try makeApp(named: "Other.app", in: source)
+        let diskImage = try await makeDiskImage(from: source, in: root)
+
+        do {
+            _ = try await ArchiveExtractor.mount(
+                diskImage,
+                at: root.appendingPathComponent("mount", isDirectory: true),
+                expectedAppName: "AppUpdater.app",
+                limits: .init(.init())
+            )
+            XCTFail("mount should throw")
+        } catch AppUpdaterError.processFailed(let executable, _, let stderr)
+            where executable.lastPathComponent == "hdiutil"
+        {
+            throw XCTSkip("hdiutil could not attach disk image: \(stderr)")
+        } catch {
+            XCTAssertEqual(error as? AppUpdaterError, .invalidDownloadedBundle)
+        }
+    }
+
+    func testArchiveExtractorRejectsMalformedDiskImage() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let diskImage = root.appendingPathComponent("malformed.dmg")
+        try Data("not a disk image".utf8).write(to: diskImage)
+
+        do {
+            _ = try await ArchiveExtractor.mount(
+                diskImage,
+                at: root.appendingPathComponent("mount", isDirectory: true),
+                expectedAppName: "AppUpdater.app",
+                limits: .init(.init())
+            )
+            XCTFail("mount should throw")
+        } catch {
+            XCTAssertFalse(FileManager.default.fileExists(
+                atPath: root.appendingPathComponent("mount/AppUpdater.app").path
+            ))
         }
     }
 
@@ -812,7 +930,7 @@ final class AppUpdaterTests: XCTestCase {
         await XCTAssertThrowsErrorAsync(try await prepared.installAndRelaunch())
 
         XCTAssertEqual(events, [
-            "validate", "validate", "replace", "validate", "restore",
+            "validate", "validate", "replace", "validate", "restore", "remove",
         ])
     }
 
@@ -830,7 +948,26 @@ final class AppUpdaterTests: XCTestCase {
 
         XCTAssertEqual(events, [
             "validate", "validate", "replace", "validate", "launch", "restore",
+            "remove",
         ])
+    }
+
+    @MainActor
+    func testPreReplacementValidationFailureCleansPreparedState() async throws {
+        var events: [String] = []
+        var driver = transactionDriver(events: { events.append($0) })
+        driver.validate = { _, _ in
+            events.append("validate")
+            throw AppUpdaterError.invalidDeveloperID
+        }
+        let prepared = preparedInstallation(
+            driver: driver,
+            cleanup: { events.append("cleanup") }
+        )
+
+        await XCTAssertThrowsErrorAsync(try await prepared.installAndRelaunch())
+
+        XCTAssertEqual(events, ["validate", "cleanup", "remove"])
     }
 
     @MainActor
@@ -929,6 +1066,32 @@ final class AppUpdaterTests: XCTestCase {
         )
         try FileManager.default.createSymbolicLink(at: symlink, withDestinationURL: owned)
         XCTAssertFalse(Installation.ownsStaleItem(symlink))
+    }
+
+    @MainActor
+    func testStaleCleanupTouchesOnlyOwnedNames() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let installed = root.appendingPathComponent("App.app", isDirectory: true)
+        let owned = root.appendingPathComponent(
+            ".app-updater-00000000-0000-0000-0000-000000000000.dmg"
+        )
+        let lookalike = root.appendingPathComponent(".app-updater-important.dmg")
+        try FileManager.default.createDirectory(at: installed, withIntermediateDirectories: true)
+        try Data().write(to: owned)
+        try Data().write(to: lookalike)
+        var removed: [URL] = []
+        var driver = transactionDriver(events: { _ in })
+        driver.remove = { url, _ in removed.append(url) }
+
+        try await Installation.cleanupStaleItems(
+            in: root,
+            excluding: installed,
+            protected: false,
+            driver: driver
+        )
+
+        XCTAssertEqual(removed.map(\.lastPathComponent), [owned.lastPathComponent])
     }
 
     @MainActor
@@ -1091,6 +1254,19 @@ private actor AsyncGate {
         let continuations = continuations
         self.continuations.removeAll()
         continuations.forEach { $0.resume() }
+    }
+}
+
+private final class RequestRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var request: URLRequest?
+
+    func set(_ request: URLRequest?) {
+        lock.withLock { self.request = request }
+    }
+
+    func value() -> URLRequest? {
+        lock.withLock { request }
     }
 }
 

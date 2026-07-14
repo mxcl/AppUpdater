@@ -157,6 +157,9 @@ public final class AppUpdater {
         guard let contentType = asset.contentType, contentType == .dmg else {
             throw AppUpdaterError.unsupportedAsset(asset.name)
         }
+        guard asset.size > 0 else {
+            throw AppUpdaterError.invalidGitHubResponse
+        }
         guard asset.size <= configuration.maximumDownloadBytes else {
             throw AppUpdaterError.resourceLimitExceeded("download size")
         }
@@ -170,7 +173,7 @@ public final class AppUpdater {
                 asset.browserDownloadURL,
                 with: session,
                 to: downloadURL,
-                maximumBytes: configuration.maximumDownloadBytes,
+                maximumBytes: asset.size,
                 timeout: configuration.timeout
             )
 
@@ -389,7 +392,7 @@ enum NetworkTransfer {
             }
             return data
         } catch {
-            throw delegate.error ?? error
+            throw delegate.error ?? mapped(error)
         }
     }
 
@@ -421,8 +424,15 @@ enum NetworkTransfer {
                 ofItemAtPath: destination.path
             )
         } catch {
-            throw delegate.error ?? error
+            throw delegate.error ?? mapped(error)
         }
+    }
+
+    private static func mapped(_ error: Error) -> Error {
+        if (error as? URLError)?.code == .timedOut {
+            return AppUpdaterError.operationTimedOut
+        }
+        return error
     }
 
     private static func validate(_ response: URLResponse) throws {
@@ -434,7 +444,7 @@ enum NetworkTransfer {
         }
     }
 
-    private final class TransferDelegate: NSObject,
+    final class TransferDelegate: NSObject,
         URLSessionTaskDelegate,
         URLSessionDownloadDelegate,
         @unchecked Sendable
@@ -755,10 +765,11 @@ enum ArchiveExtractor {
             }
             let values = try url.resourceValues(forKeys: keys)
             if values.isRegularFile == true {
-                bytes += Int64(values.fileSize ?? 0)
-                guard bytes <= limits.maximumBytes else {
+                let size = Int64(values.fileSize ?? 0)
+                guard size <= limits.maximumBytes - bytes else {
                     throw AppUpdaterError.resourceLimitExceeded("mounted content size")
                 }
+                bytes += size
             }
         }
     }
@@ -1103,9 +1114,14 @@ final class PreparedInstallation {
     }
 
     func installAndRelaunch() async throws {
-        try driver.validate(installedURL, expectedIdentity)
-        try driver.validate(candidateURL, expectedIdentity)
-        try await driver.replace(candidateURL, installedURL, backupURL, protected)
+        do {
+            try driver.validate(installedURL, expectedIdentity)
+            try driver.validate(candidateURL, expectedIdentity)
+            try await driver.replace(candidateURL, installedURL, backupURL, protected)
+        } catch {
+            await discard()
+            throw error
+        }
         do {
             try driver.validate(installedURL, expectedIdentity)
             try await driver.launch(installedURL)
@@ -1113,8 +1129,10 @@ final class PreparedInstallation {
             do {
                 try await driver.restore(installedURL, backupURL, protected)
             } catch {
+                await discard()
                 throw AppUpdaterError.rollbackFailed
             }
+            await discard()
             throw error
         }
 
@@ -1147,6 +1165,7 @@ enum Installation {
             lease.mount.imageURL.lastPathComponent
         )
         let mountRoot = try AppUpdater.stagingDirectory()
+        var preparedMount: ArchiveExtractor.Mount?
 
         do {
             try await cleanupStaleItems(
@@ -1167,6 +1186,7 @@ enum Installation {
                 expectedAppName: installedURL.lastPathComponent,
                 limits: limits
             )
+            preparedMount = mount
             guard let candidate = Bundle(url: mount.appURL) else {
                 throw AppUpdaterError.invalidDownloadedBundle
             }
@@ -1190,6 +1210,7 @@ enum Installation {
                 }
             ).publicUpdate()
         } catch {
+            await preparedMount?.discard()
             await lease.discard()
             try? FileManager.default.removeItem(at: mountRoot)
             try? await driver.remove(promotedImage, protected)

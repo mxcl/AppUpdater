@@ -23,7 +23,8 @@ let package = Package(
         .testTarget(
             name: "AppUpdaterTests",
             dependencies: ["AppUpdater"],
-            path: "Tests"
+            path: "Tests",
+            exclude: ["MANUAL.md"]
         ),
     ],
     swiftLanguageModes: [.v6]
