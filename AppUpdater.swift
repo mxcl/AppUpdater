@@ -16,29 +16,55 @@ public final class AppUpdater {
 
     public var allowPrereleases = false
 
+    public struct Configuration: Sendable {
+        public var maximumDownloadBytes: Int64
+        public var maximumMountedBytes: Int64
+        public var maximumEntries: Int
+        public var timeout: TimeInterval
+
+        public init(
+            maximumDownloadBytes: Int64 = 2 * 1024 * 1024 * 1024,
+            maximumMountedBytes: Int64 = 4 * 1024 * 1024 * 1024,
+            maximumEntries: Int = 100_000,
+            timeout: TimeInterval = 10 * 60
+        ) {
+            precondition(maximumDownloadBytes > 0)
+            precondition(maximumMountedBytes > 0)
+            precondition(maximumEntries > 0)
+            precondition(timeout > 0)
+            self.maximumDownloadBytes = maximumDownloadBytes
+            self.maximumMountedBytes = maximumMountedBytes
+            self.maximumEntries = maximumEntries
+            self.timeout = timeout
+        }
+    }
+
     public init(
         owner: String,
         repo: String,
-        targetBundle: Bundle = .main,
-        session: URLSession = .shared
+        configuration: Configuration = .init(),
+        sessionConfiguration: URLSessionConfiguration = .default
     ) {
+        let session = URLSession(configuration: sessionConfiguration)
         self.owner = owner
         self.repo = repo
         self.session = session
-        hasExecutable = { targetBundle.executableURL != nil }
-        currentVersion = { try targetBundle.appVersion }
+        hasExecutable = { Bundle.main.executableURL != nil }
+        currentVersion = { try Bundle.main.appVersion }
         fetchReleases = {
             try await Self.fetchReleases(
                 owner: owner,
                 repo: repo,
-                session: session
+                session: session,
+                configuration: configuration
             )
         }
         stageAsset = { asset in
             try await Self.stageUpdate(
                 with: asset,
-                replacing: targetBundle,
-                session: session
+                replacing: .main,
+                session: session,
+                configuration: configuration
             )
         }
     }
@@ -98,19 +124,20 @@ public final class AppUpdater {
     static func fetchReleases(
         owner: String,
         repo: String,
-        session: URLSession
+        session: URLSession,
+        configuration: Configuration = .init()
     ) async throws -> [Release] {
         let slug = "\(owner)/\(repo)"
         let url = URL(string: "https://api.github.com/repos/\(slug)/releases")!
         var request = URLRequest(url: url)
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
 
-        let (data, response) = try await session.data(for: request)
-        guard let response = response as? HTTPURLResponse,
-              200..<300 ~= response.statusCode
-        else {
-            throw AppUpdaterError.invalidGitHubResponse
-        }
+        request.timeoutInterval = configuration.timeout
+        let data = try await NetworkTransfer.data(
+            for: request,
+            with: session,
+            maximumBytes: min(configuration.maximumDownloadBytes, 10 * 1024 * 1024)
+        )
         let decoder = JSONDecoder()
         decoder.userInfo[.decodingMethod] = DecodingMethod.tolerant
         return try decoder.decode([Release].self, from: data)
@@ -119,51 +146,69 @@ public final class AppUpdater {
     private static func stageUpdate(
         with asset: Release.Asset,
         replacing installedAppBundle: Bundle,
-        session: URLSession
+        session: URLSession,
+        configuration: Configuration
     ) async throws -> Update {
         guard asset.browserDownloadURL.scheme == "https" else {
             throw AppUpdaterError.insecureDownloadURL
         }
 
+        guard let contentType = asset.contentType, contentType == .dmg else {
+            throw AppUpdaterError.unsupportedAsset(asset.name)
+        }
+        guard asset.size <= configuration.maximumDownloadBytes else {
+            throw AppUpdaterError.resourceLimitExceeded("download size")
+        }
+
         let tmpdir = try Self.stagingDirectory()
+        do {
+            let downloadURL = tmpdir.appendingPathComponent(
+                ".app-updater-\(UUID().uuidString).dmg"
+            )
+            try await NetworkTransfer.download(
+                asset.browserDownloadURL,
+                with: session,
+                to: downloadURL,
+                maximumBytes: configuration.maximumDownloadBytes,
+                timeout: configuration.timeout
+            )
 
-        let downloadURL = tmpdir.appendingPathComponent("download")
-        let (downloadedURL, _) = try await session.download(
-            from: asset.browserDownloadURL
-        )
-        try FileManager.default.moveItem(at: downloadedURL, to: downloadURL)
+            let downloadedAppBundleURL = try await ArchiveExtractor.extract(
+                downloadURL,
+                contentType: contentType,
+                into: tmpdir,
+                limits: .init(configuration)
+            )
+            guard let downloadedAppBundle = Bundle(url: downloadedAppBundleURL) else {
+                throw AppUpdaterError.invalidDownloadedBundle
+            }
 
-        let downloadedAppBundleURL = try await ArchiveExtractor.extract(
-            downloadURL,
-            contentType: asset.contentType,
-            into: tmpdir
-        )
-        guard let downloadedAppBundle = Bundle(url: downloadedAppBundleURL) else {
-            throw AppUpdaterError.invalidDownloadedBundle
+            try CodeSignature.requireSameSigner(
+                current: installedAppBundle,
+                candidate: downloadedAppBundle
+            )
+
+            guard let executableURL = downloadedAppBundle.executableURL else {
+                throw AppUpdaterError.invalidDownloadedBundle
+            }
+            let relativeExecutablePath = executableURL.path.replacingOccurrences(
+                of: downloadedAppBundle.bundleURL.path + "/",
+                with: ""
+            )
+            let finalExecutableURL = installedAppBundle.bundleURL
+                .appendingPathComponent(relativeExecutablePath)
+
+            return Update(
+                assetName: asset.name,
+                stagedBundleURL: downloadedAppBundle.bundleURL,
+                installedBundleURL: installedAppBundle.bundleURL,
+                executableURL: finalExecutableURL,
+                stagingDirectoryURL: tmpdir
+            )
+        } catch {
+            try? FileManager.default.removeItem(at: tmpdir)
+            throw error
         }
-
-        try CodeSignature.requireSameSigner(
-            current: installedAppBundle,
-            candidate: downloadedAppBundle
-        )
-
-        guard let executableURL = downloadedAppBundle.executableURL else {
-            throw AppUpdaterError.invalidDownloadedBundle
-        }
-        let relativeExecutablePath = executableURL.path.replacingOccurrences(
-            of: downloadedAppBundle.bundleURL.path + "/",
-            with: ""
-        )
-        let finalExecutableURL = installedAppBundle.bundleURL
-            .appendingPathComponent(relativeExecutablePath)
-
-        return Update(
-            assetName: asset.name,
-            stagedBundleURL: downloadedAppBundle.bundleURL,
-            installedBundleURL: installedAppBundle.bundleURL,
-            executableURL: finalExecutableURL,
-            stagingDirectoryURL: tmpdir
-        )
     }
 
     static func stagingDirectory() throws -> URL {
@@ -174,7 +219,8 @@ public final class AppUpdater {
         )
         try FileManager.default.createDirectory(
             at: url,
-            withIntermediateDirectories: false
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
         )
         return url
     }
@@ -225,19 +271,23 @@ public struct Update: Sendable {
     }
 }
 
-enum AppUpdaterError: LocalizedError, Equatable {
+public enum AppUpdaterError: LocalizedError, Equatable {
     case bundleExecutableURL
     case invalidAppVersion(String)
     case invalidArchiveEntry(String)
     case invalidDownloadedBundle
     case invalidGitHubResponse
     case insecureDownloadURL
+    case invalidHTTPResponse
     case missingCodeSigningInfo
     case mismatchedCodeSigningInfo
+    case operationTimedOut
     case processFailed(URL, Int32, String)
+    case resourceLimitExceeded(String)
+    case unsupportedAsset(String)
     case unsupportedContentType(String)
 
-    var errorDescription: String? {
+    public var errorDescription: String? {
         switch self {
         case .bundleExecutableURL:
             "The running bundle has no executable URL."
@@ -251,15 +301,143 @@ enum AppUpdaterError: LocalizedError, Equatable {
             "GitHub returned an invalid response."
         case .insecureDownloadURL:
             "The release asset download URL is not HTTPS."
+        case .invalidHTTPResponse:
+            "The server returned an invalid or insecure response."
         case .missingCodeSigningInfo:
             "A bundle is missing required code-signing information."
         case .mismatchedCodeSigningInfo:
             "The downloaded app was signed by a different identity."
+        case .operationTimedOut:
+            "The update operation timed out."
         case .processFailed(let executable, let status, let stderr):
             "\(executable.path) failed with status \(status): \(stderr)"
+        case .resourceLimitExceeded(let resource):
+            "The update exceeded the configured \(resource) limit."
+        case .unsupportedAsset(let asset):
+            "Unsupported release asset: \(asset). Only DMGs are supported."
         case .unsupportedContentType(let contentType):
             "Unsupported release asset content type: \(contentType)."
         }
+    }
+}
+
+enum NetworkTransfer {
+    static func data(
+        for request: URLRequest,
+        with session: URLSession,
+        maximumBytes: Int64
+    ) async throws -> Data {
+        let delegate = TransferDelegate(maximumBytes: maximumBytes)
+        do {
+            let (data, response) = try await session.data(
+                for: request,
+                delegate: delegate
+            )
+            if let error = delegate.error { throw error }
+            try validate(response)
+            guard data.count <= maximumBytes else {
+                throw AppUpdaterError.resourceLimitExceeded("response size")
+            }
+            return data
+        } catch {
+            throw delegate.error ?? error
+        }
+    }
+
+    static func download(
+        _ url: URL,
+        with session: URLSession,
+        to destination: URL,
+        maximumBytes: Int64,
+        timeout: TimeInterval
+    ) async throws {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = timeout
+        let delegate = TransferDelegate(maximumBytes: maximumBytes)
+        do {
+            let (temporaryURL, response) = try await session.download(
+                for: request,
+                delegate: delegate
+            )
+            if let error = delegate.error { throw error }
+            try validate(response)
+            let size = try temporaryURL.resourceValues(forKeys: [.fileSizeKey])
+                .fileSize ?? 0
+            guard size <= maximumBytes else {
+                throw AppUpdaterError.resourceLimitExceeded("download size")
+            }
+            try FileManager.default.moveItem(at: temporaryURL, to: destination)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: destination.path
+            )
+        } catch {
+            throw delegate.error ?? error
+        }
+    }
+
+    private static func validate(_ response: URLResponse) throws {
+        guard response.url?.scheme?.lowercased() == "https",
+              let response = response as? HTTPURLResponse,
+              200..<300 ~= response.statusCode
+        else {
+            throw AppUpdaterError.invalidHTTPResponse
+        }
+    }
+
+    private final class TransferDelegate: NSObject,
+        URLSessionTaskDelegate,
+        URLSessionDownloadDelegate,
+        @unchecked Sendable
+    {
+        private let maximumBytes: Int64
+        private let lock = NSLock()
+        private var storedError: AppUpdaterError?
+
+        init(maximumBytes: Int64) {
+            self.maximumBytes = maximumBytes
+        }
+
+        var error: AppUpdaterError? {
+            lock.withLock { storedError }
+        }
+
+        func urlSession(
+            _ session: URLSession,
+            task: URLSessionTask,
+            willPerformHTTPRedirection response: HTTPURLResponse,
+            newRequest request: URLRequest,
+            completionHandler: @escaping @Sendable (URLRequest?) -> Void
+        ) {
+            guard request.url?.scheme?.lowercased() == "https" else {
+                lock.withLock {
+                    storedError = .insecureDownloadURL
+                }
+                completionHandler(nil)
+                return
+            }
+            completionHandler(request)
+        }
+
+        func urlSession(
+            _ session: URLSession,
+            downloadTask: URLSessionDownloadTask,
+            didWriteData bytesWritten: Int64,
+            totalBytesWritten: Int64,
+            totalBytesExpectedToWrite: Int64
+        ) {
+            guard totalBytesWritten > maximumBytes else { return }
+            lock.withLock {
+                storedError = .resourceLimitExceeded("download size")
+            }
+            downloadTask.cancel()
+        }
+
+        func urlSession(
+            _ session: URLSession,
+            downloadTask: URLSessionDownloadTask,
+            didFinishDownloadingTo location: URL
+        ) {}
     }
 }
 
@@ -277,12 +455,14 @@ struct Release: Decodable, Comparable {
     struct Asset: Decodable, Equatable {
         let name: String
         let browserDownloadURL: URL
-        let contentType: ContentType
+        let contentType: ContentType?
+        let size: Int64
 
         enum CodingKeys: String, CodingKey {
             case name
             case browserDownloadURL = "browser_download_url"
             case contentType = "content_type"
+            case size
         }
 
         init(from decoder: Decoder) throws {
@@ -296,10 +476,11 @@ struct Release: Decodable, Comparable {
                 String.self,
                 forKey: .contentType
             )
-            contentType = try ContentType(
+            contentType = ContentType(
                 rawValue: rawContentType,
                 assetName: name
             )
+            size = try container.decodeIfPresent(Int64.self, forKey: .size) ?? 0
         }
     }
 
@@ -309,14 +490,7 @@ struct Release: Decodable, Comparable {
             let name = (asset.name as NSString).deletingPathExtension
                 .lowercased()
 
-            switch (name, asset.contentType) {
-            case ("\(prefix).tar", .tar):
-                return true
-            case (prefix, _):
-                return true
-            default:
-                return false
-            }
+            return name == prefix && asset.contentType == .dmg
         }
     }
 
@@ -326,21 +500,18 @@ struct Release: Decodable, Comparable {
 }
 
 enum ContentType: Decodable, Equatable {
-    case zip
-    case tar
     case dmg
 
     init(from decoder: Decoder) throws {
         let rawValue = try decoder.singleValueContainer().decode(String.self)
-        try self.init(rawValue: rawValue, assetName: nil)
+        guard let value = Self(rawValue: rawValue, assetName: nil) else {
+            throw AppUpdaterError.unsupportedContentType(rawValue)
+        }
+        self = value
     }
 
-    init(rawValue: String, assetName: String?) throws {
+    init?(rawValue: String, assetName: String?) {
         switch rawValue {
-        case "application/x-bzip2", "application/x-xz", "application/x-gzip":
-            self = .tar
-        case "application/zip":
-            self = .zip
         case "application/x-apple-diskimage":
             self = .dmg
         case let value where [
@@ -349,7 +520,7 @@ enum ContentType: Decodable, Equatable {
         ].contains(value) && assetName?.lowercased().hasSuffix(".dmg") == true:
             self = .dmg
         default:
-            throw AppUpdaterError.unsupportedContentType(rawValue)
+            return nil
         }
     }
 }
@@ -374,10 +545,23 @@ extension Array where Element == Release {
 }
 
 enum ArchiveExtractor {
+    struct Limits: Sendable {
+        let maximumBytes: Int64
+        let maximumEntries: Int
+        let timeout: TimeInterval
+
+        init(_ configuration: AppUpdater.Configuration) {
+            maximumBytes = configuration.maximumMountedBytes
+            maximumEntries = configuration.maximumEntries
+            timeout = configuration.timeout
+        }
+    }
+
     static func extract(
         _ url: URL,
         contentType: ContentType,
-        into directory: URL
+        into directory: URL,
+        limits: Limits = .init(.init())
     ) async throws -> URL {
         let extractionDirectory = directory.appendingPathComponent(
             "extracted",
@@ -388,69 +572,17 @@ enum ArchiveExtractor {
             withIntermediateDirectories: true
         )
 
-        switch contentType {
-        case .dmg:
-            return try await extractDiskImage(url, into: extractionDirectory)
-        case .tar:
-            let entries = try await entries(in: url, contentType: contentType)
-            try validate(entries: entries)
-            _ = try await ProcessRunner.run(
-                URL(fileURLWithPath: "/usr/bin/tar"),
-                arguments: ["-xf", url.path, "-C", extractionDirectory.path]
-            )
-        case .zip:
-            let entries = try await entries(in: url, contentType: contentType)
-            try validate(entries: entries)
-            _ = try await ProcessRunner.run(
-                URL(fileURLWithPath: "/usr/bin/ditto"),
-                arguments: ["-x", "-k", url.path, extractionDirectory.path]
-            )
-        }
-
-        return try findSingleApp(in: extractionDirectory)
-    }
-
-    static func validate(entries: [String]) throws {
-        guard !entries.isEmpty else {
-            throw AppUpdaterError.invalidDownloadedBundle
-        }
-
-        for entry in entries {
-            let path = entry.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-            let components = path.split(separator: "/").map(String.init)
-            guard !entry.hasPrefix("/"),
-                  !components.contains("..")
-            else {
-                throw AppUpdaterError.invalidArchiveEntry(entry)
-            }
-        }
-    }
-
-    private static func entries(
-        in url: URL,
-        contentType: ContentType
-    ) async throws -> [String] {
-        switch contentType {
-        case .dmg:
-            throw AppUpdaterError.unsupportedContentType("application/x-apple-diskimage")
-        case .tar:
-            let output = try await ProcessRunner.run(
-                URL(fileURLWithPath: "/usr/bin/tar"),
-                arguments: ["-tf", url.path]
-            )
-            return output.stdout.lines
-        case .zip:
-            let output = try await ProcessRunner.run(
-                URL(fileURLWithPath: "/usr/bin/unzip"),
-                arguments: ["-Z", "-1", url.path]
-            )
-            return output.stdout.lines
-        }
+        return try await extractDiskImage(
+            url,
+            into: extractionDirectory,
+            limits: limits
+        )
     }
 
     private static func extractDiskImage(
         _ url: URL,
-        into extractionDirectory: URL
+        into extractionDirectory: URL,
+        limits: Limits
     ) async throws -> URL {
         let mountDirectory = extractionDirectory
             .deletingLastPathComponent()
@@ -460,25 +592,63 @@ enum ArchiveExtractor {
             withIntermediateDirectories: true
         )
 
-        let mountPoint = try await attachDiskImage(url, at: mountDirectory)
+        let mountPoint = try await attachDiskImage(
+            url,
+            at: mountDirectory,
+            timeout: limits.timeout
+        )
         do {
             let app = try findSingleApp(in: mountPoint)
+            try inspect(app, limits: limits)
             let destination = extractionDirectory.appendingPathComponent(
                 app.lastPathComponent,
                 isDirectory: true
             )
             try FileManager.default.copyItem(at: app, to: destination)
-            try await detachDiskImage(at: mountPoint)
+            try await detachDiskImage(at: mountPoint, timeout: limits.timeout)
             return try findSingleApp(in: extractionDirectory)
         } catch {
-            try? await detachDiskImage(at: mountPoint)
+            try? await detachDiskImage(at: mountPoint, timeout: limits.timeout)
             throw error
+        }
+    }
+
+    static func inspect(_ app: URL, limits: Limits) throws {
+        let keys: Set<URLResourceKey> = [.isRegularFileKey, .fileSizeKey]
+        guard let enumerator = FileManager.default.enumerator(
+            at: app,
+            includingPropertiesForKeys: Array(keys),
+            options: [],
+            errorHandler: { _, _ in false }
+        ) else {
+            throw AppUpdaterError.invalidDownloadedBundle
+        }
+
+        let deadline = Date().addingTimeInterval(limits.timeout)
+        var entries = 0
+        var bytes: Int64 = 0
+        while let url = enumerator.nextObject() as? URL {
+            guard Date() < deadline else {
+                throw AppUpdaterError.operationTimedOut
+            }
+            entries += 1
+            guard entries <= limits.maximumEntries else {
+                throw AppUpdaterError.resourceLimitExceeded("mounted entry count")
+            }
+            let values = try url.resourceValues(forKeys: keys)
+            if values.isRegularFile == true {
+                bytes += Int64(values.fileSize ?? 0)
+                guard bytes <= limits.maximumBytes else {
+                    throw AppUpdaterError.resourceLimitExceeded("mounted content size")
+                }
+            }
         }
     }
 
     private static func attachDiskImage(
         _ url: URL,
-        at mountPoint: URL
+        at mountPoint: URL,
+        timeout: TimeInterval
     ) async throws -> URL {
         let output = try await ProcessRunner.run(
             URL(fileURLWithPath: "/usr/bin/hdiutil"),
@@ -490,15 +660,20 @@ enum ArchiveExtractor {
                 "-mountpoint",
                 mountPoint.path,
                 url.path,
-            ]
+            ],
+            timeout: timeout
         )
         return diskImageMountPoint(from: output.stdout) ?? mountPoint
     }
 
-    private static func detachDiskImage(at mountPoint: URL) async throws {
+    private static func detachDiskImage(
+        at mountPoint: URL,
+        timeout: TimeInterval
+    ) async throws {
         _ = try await ProcessRunner.run(
             URL(fileURLWithPath: "/usr/bin/hdiutil"),
-            arguments: ["detach", mountPoint.path]
+            arguments: ["detach", mountPoint.path],
+            timeout: timeout
         )
     }
 
@@ -666,6 +841,30 @@ enum InstallerHelper {
 }
 
 enum ProcessRunner {
+    private final class TimeoutState: @unchecked Sendable {
+        private let lock = NSLock()
+        private var workItem: DispatchWorkItem?
+        private var didTimeOut = false
+
+        var timedOut: Bool { lock.withLock { didTimeOut } }
+
+        func schedule(after timeout: TimeInterval, process: Process) {
+            let workItem = DispatchWorkItem { [weak self, weak process] in
+                self?.lock.withLock { self?.didTimeOut = true }
+                process?.terminate()
+            }
+            lock.withLock { self.workItem = workItem }
+            DispatchQueue.global().asyncAfter(
+                deadline: .now() + timeout,
+                execute: workItem
+            )
+        }
+
+        func cancel() {
+            lock.withLock { workItem }?.cancel()
+        }
+    }
+
     struct Output {
         let stdout: String
         let stderr: String
@@ -674,12 +873,14 @@ enum ProcessRunner {
     static func run(
         _ executableURL: URL,
         arguments: [String],
-        currentDirectory: URL? = nil
+        currentDirectory: URL? = nil,
+        timeout: TimeInterval? = nil
     ) async throws -> Output {
         try await withCheckedThrowingContinuation { continuation in
             let process = Process()
             let stdout = Pipe()
             let stderr = Pipe()
+            let timeoutState = TimeoutState()
 
             process.executableURL = executableURL
             process.arguments = arguments
@@ -687,13 +888,16 @@ enum ProcessRunner {
             process.standardOutput = stdout
             process.standardError = stderr
             process.terminationHandler = { process in
+                timeoutState.cancel()
                 let stdoutData = stdout.fileHandleForReading.readDataToEndOfFile()
                 let stderrData = stderr.fileHandleForReading.readDataToEndOfFile()
                 let output = Output(
                     stdout: String(data: stdoutData, encoding: .utf8) ?? "",
                     stderr: String(data: stderrData, encoding: .utf8) ?? ""
                 )
-                guard process.terminationStatus == 0 else {
+                if timeoutState.timedOut {
+                    continuation.resume(throwing: AppUpdaterError.operationTimedOut)
+                } else if process.terminationStatus != 0 {
                     continuation.resume(
                         throwing: AppUpdaterError.processFailed(
                             executableURL,
@@ -701,13 +905,16 @@ enum ProcessRunner {
                             output.stderr
                         )
                     )
-                    return
+                } else {
+                    continuation.resume(returning: output)
                 }
-                continuation.resume(returning: output)
             }
 
             do {
                 try process.run()
+                if let timeout {
+                    timeoutState.schedule(after: timeout, process: process)
+                }
             } catch {
                 continuation.resume(throwing: error)
             }

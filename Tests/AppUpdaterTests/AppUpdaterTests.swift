@@ -10,26 +10,6 @@ final class AppUpdaterTests: XCTestCase {
         XCTAssertFalse(updater.allowPrereleases)
     }
 
-    @MainActor
-    func testPublicInitializerReadsVersionFromTargetBundle() async throws {
-        let root = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let targetBundle = try makeBundle(named: "Target", version: "not-a-version", in: root)
-        let updater = AppUpdater(
-            owner: "mxcl",
-            repo: "AppUpdater",
-            targetBundle: targetBundle,
-            session: .stubbed(statusCode: 200, body: "[]")
-        )
-
-        do {
-            _ = try await updater.check()
-            XCTFail("check should throw")
-        } catch {
-            XCTAssertEqual(error as? AppUpdaterError, .invalidAppVersion("not-a-version"))
-        }
-    }
-
     func testFetchReleasesUsesGitHubAPIAndTolerantVersionDecoding() async throws {
         let session = URLSession.stubbed(
             statusCode: 200,
@@ -40,9 +20,10 @@ final class AppUpdaterTests: XCTestCase {
                 "prerelease": false,
                 "assets": [
                   {
-                    "name": "AppUpdater-2.1.0.zip",
-                    "browser_download_url": "https://example.com/app.zip",
-                    "content_type": "application/zip"
+                    "name": "AppUpdater-2.1.0.dmg",
+                    "browser_download_url": "https://example.com/app.dmg",
+                    "content_type": "application/x-apple-diskimage",
+                    "size": 42
                   }
                 ]
               }
@@ -79,7 +60,7 @@ final class AppUpdaterTests: XCTestCase {
             )
             XCTFail("fetch should throw")
         } catch {
-            XCTAssertEqual(error as? AppUpdaterError, .invalidGitHubResponse)
+            XCTAssertEqual(error as? AppUpdaterError, .invalidHTTPResponse)
         }
     }
 
@@ -98,10 +79,53 @@ final class AppUpdaterTests: XCTestCase {
         }
     }
 
+    func testNetworkTransferRejectsNonHTTPSFinalURL() async throws {
+        let session = URLSession.stubbed(
+            statusCode: 200,
+            body: "[]",
+            responseURL: URL(string: "http://example.com/releases")!
+        )
+        let request = URLRequest(
+            url: URL(string: "https://example.com/releases")!
+        )
+
+        do {
+            _ = try await NetworkTransfer.data(
+                for: request,
+                with: session,
+                maximumBytes: 100
+            )
+            XCTFail("transfer should throw")
+        } catch {
+            XCTAssertEqual(error as? AppUpdaterError, .invalidHTTPResponse)
+        }
+    }
+
+    func testNetworkTransferRejectsOversizedResponse() async throws {
+        let session = URLSession.stubbed(statusCode: 200, body: "12345")
+        let request = URLRequest(
+            url: URL(string: "https://example.com/releases")!
+        )
+
+        do {
+            _ = try await NetworkTransfer.data(
+                for: request,
+                with: session,
+                maximumBytes: 4
+            )
+            XCTFail("transfer should throw")
+        } catch {
+            XCTAssertEqual(
+                error as? AppUpdaterError,
+                .resourceLimitExceeded("response size")
+            )
+        }
+    }
+
     @MainActor
     func testCheckUpdatesSelectedAsset() async throws {
         let releases = try [
-            release("2.0.0", prerelease: false, assetName: "AppUpdater-2.0.0.zip"),
+            release("2.0.0", prerelease: false, assetName: "AppUpdater-2.0.0.dmg"),
         ]
         let updater = AppUpdater(
             owner: "mxcl",
@@ -113,7 +137,7 @@ final class AppUpdaterTests: XCTestCase {
 
         let update = try await updater.check()
 
-        XCTAssertEqual(update?.assetName, "AppUpdater-2.0.0.zip")
+        XCTAssertEqual(update?.assetName, "AppUpdater-2.0.0.dmg")
     }
 
     @MainActor
@@ -141,7 +165,7 @@ final class AppUpdaterTests: XCTestCase {
     @MainActor
     func testCheckDoesNotUpdateWithoutMatchingAsset() async throws {
         let releases = try [
-            release("2.0.0", prerelease: false, assetName: "OtherApp-2.0.0.zip"),
+            release("2.0.0", prerelease: false, assetName: "OtherApp-2.0.0.dmg"),
         ]
         let updater = AppUpdater(
             owner: "mxcl",
@@ -162,7 +186,7 @@ final class AppUpdaterTests: XCTestCase {
     @MainActor
     func testCheckRespectsPrereleaseOptIn() async throws {
         let releases = try [
-            release("2.0.0-beta.1", prerelease: true, assetName: "AppUpdater-2.0.0-beta.1.zip"),
+            release("2.0.0-beta.1", prerelease: true, assetName: "AppUpdater-2.0.0-beta.1.dmg"),
         ]
         let updater = AppUpdater(
             owner: "mxcl",
@@ -175,7 +199,7 @@ final class AppUpdaterTests: XCTestCase {
 
         let update = try await updater.check()
 
-        XCTAssertEqual(update?.assetName, "AppUpdater-2.0.0-beta.1.zip")
+        XCTAssertEqual(update?.assetName, "AppUpdater-2.0.0-beta.1.dmg")
     }
 
     @MainActor
@@ -184,7 +208,7 @@ final class AppUpdaterTests: XCTestCase {
         let release = try release(
             "2.0.0",
             prerelease: false,
-            assetName: "AppUpdater-2.0.0.zip"
+            assetName: "AppUpdater-2.0.0.dmg"
         )
         let updater = AppUpdater(
             owner: "mxcl",
@@ -204,21 +228,21 @@ final class AppUpdaterTests: XCTestCase {
 
         let updates = try await [first, second]
         XCTAssertEqual(updates.map(\.?.assetName), [
-            "AppUpdater-2.0.0.zip",
-            "AppUpdater-2.0.0.zip",
+            "AppUpdater-2.0.0.dmg",
+            "AppUpdater-2.0.0.dmg",
         ])
         let waiterCount = await gate.waitCallCount()
         XCTAssertEqual(waiterCount, 1)
     }
 
-    func testReleaseDecodingAcceptsSupportedContentTypes() throws {
+    func testReleaseDecodingIgnoresZipAssets() throws {
         let json = """
         {
           "tag_name": "2.0.0",
           "prerelease": false,
           "assets": [
             {
-              "name": "AppUpdater-2.0.0.zip",
+              "name": "AppUpdater-2.0.0.dmg",
               "browser_download_url": "https://example.com/AppUpdater.zip",
               "content_type": "application/zip"
             }
@@ -229,7 +253,8 @@ final class AppUpdaterTests: XCTestCase {
         let release = try JSONDecoder().decode(Release.self, from: json)
 
         XCTAssertEqual(release.tagName, Version(2, 0, 0))
-        XCTAssertEqual(release.assets.first?.contentType, .zip)
+        XCTAssertNil(release.assets.first?.contentType)
+        XCTAssertNil(release.viableAsset(forRepo: "AppUpdater"))
     }
 
     func testReleaseDecodingAcceptsVPrefixedTags() throws {
@@ -292,7 +317,7 @@ final class AppUpdaterTests: XCTestCase {
         XCTAssertEqual(release.assets.first?.contentType, .dmg)
     }
 
-    func testReleaseDecodingRejectsUnsupportedContentTypes() {
+    func testReleaseDecodingIgnoresNonDiskImageAssets() throws {
         let json = """
         {
           "tag_name": "2.0.0",
@@ -307,38 +332,15 @@ final class AppUpdaterTests: XCTestCase {
         }
         """.data(using: .utf8)!
 
-        XCTAssertThrowsError(try JSONDecoder().decode(Release.self, from: json))
-    }
-
-    func testReleaseDecodingAcceptsTarContentTypes() throws {
-        let json = """
-        {
-          "tag_name": "2.0.0",
-          "prerelease": false,
-          "assets": [
-            {
-              "name": "AppUpdater-2.0.0.tar.gz",
-              "browser_download_url": "https://example.com/AppUpdater.tar.gz",
-              "content_type": "application/x-gzip"
-            }
-          ]
-        }
-        """.data(using: .utf8)!
-
         let release = try JSONDecoder().decode(Release.self, from: json)
-
-        XCTAssertEqual(release.assets.first?.contentType, .tar)
-        XCTAssertEqual(
-            release.viableAsset(forRepo: "AppUpdater")?.name,
-            "AppUpdater-2.0.0.tar.gz"
-        )
+        XCTAssertNil(release.assets.first?.contentType)
     }
 
     func testFindViableUpdateSelectsHighestStableRelease() throws {
         let releases = try [
-            release("1.5.0", prerelease: false, assetName: "AppUpdater-1.5.0.zip"),
-            release("2.0.0-beta.1", prerelease: true, assetName: "AppUpdater-2.0.0-beta.1.zip"),
-            release("1.9.0", prerelease: false, assetName: "AppUpdater-1.9.0.zip"),
+            release("1.5.0", prerelease: false, assetName: "AppUpdater-1.5.0.dmg"),
+            release("2.0.0-beta.1", prerelease: true, assetName: "AppUpdater-2.0.0-beta.1.dmg"),
+            release("1.9.0", prerelease: false, assetName: "AppUpdater-1.9.0.dmg"),
         ]
 
         let asset = try releases.findViableUpdate(
@@ -347,13 +349,13 @@ final class AppUpdaterTests: XCTestCase {
             prerelease: false
         )
 
-        XCTAssertEqual(asset?.name, "AppUpdater-1.9.0.zip")
+        XCTAssertEqual(asset?.name, "AppUpdater-1.9.0.dmg")
     }
 
     func testFindViableUpdateCanSelectPrerelease() throws {
         let releases = try [
-            release("1.9.0", prerelease: false, assetName: "AppUpdater-1.9.0.zip"),
-            release("2.0.0-beta.1", prerelease: true, assetName: "AppUpdater-2.0.0-beta.1.zip"),
+            release("1.9.0", prerelease: false, assetName: "AppUpdater-1.9.0.dmg"),
+            release("2.0.0-beta.1", prerelease: true, assetName: "AppUpdater-2.0.0-beta.1.dmg"),
         ]
 
         let asset = try releases.findViableUpdate(
@@ -362,7 +364,7 @@ final class AppUpdaterTests: XCTestCase {
             prerelease: true
         )
 
-        XCTAssertEqual(asset?.name, "AppUpdater-2.0.0-beta.1.zip")
+        XCTAssertEqual(asset?.name, "AppUpdater-2.0.0-beta.1.dmg")
     }
 
     func testFindViableUpdateCanSelectDiskImage() throws {
@@ -387,8 +389,8 @@ final class AppUpdaterTests: XCTestCase {
 
     func testFindViableUpdateSkipsReleasesWithoutMatchingAssets() throws {
         let releases = try [
-            release("2.0.0", prerelease: false, assetName: "OtherApp-2.0.0.zip"),
-            release("1.9.0", prerelease: false, assetName: "AppUpdater-1.9.0.zip"),
+            release("2.0.0", prerelease: false, assetName: "OtherApp-2.0.0.dmg"),
+            release("1.9.0", prerelease: false, assetName: "AppUpdater-1.9.0.dmg"),
         ]
 
         let asset = try releases.findViableUpdate(
@@ -397,12 +399,12 @@ final class AppUpdaterTests: XCTestCase {
             prerelease: false
         )
 
-        XCTAssertEqual(asset?.name, "AppUpdater-1.9.0.zip")
+        XCTAssertEqual(asset?.name, "AppUpdater-1.9.0.dmg")
     }
 
     func testFindViableUpdateReturnsNilWhenAlreadyCurrent() throws {
         let releases = try [
-            release("1.9.0", prerelease: false, assetName: "AppUpdater-1.9.0.zip"),
+            release("1.9.0", prerelease: false, assetName: "AppUpdater-1.9.0.dmg"),
         ]
 
         let asset = try releases.findViableUpdate(
@@ -440,97 +442,53 @@ final class AppUpdaterTests: XCTestCase {
         )
         XCTAssertTrue(isDirectory.boolValue)
         XCTAssertFalse(directory.path.contains("/TemporaryItems/NSIRD_"))
+        let attributes = try FileManager.default.attributesOfItem(
+            atPath: directory.path
+        )
+        XCTAssertEqual(attributes[.posixPermissions] as? Int, 0o700)
     }
 
-    func testArchiveValidationRejectsAbsolutePaths() {
+    func testMountedContentInspectionEnforcesEntryLimit() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data().write(to: root.appendingPathComponent("one"))
+        try Data().write(to: root.appendingPathComponent("two"))
+
         XCTAssertThrowsError(
-            try ArchiveExtractor.validate(entries: ["/tmp/evil.app/Contents/MacOS/evil"])
+            try ArchiveExtractor.inspect(
+                root,
+                limits: .init(
+                    .init(maximumMountedBytes: 100, maximumEntries: 1)
+                )
+            )
         ) { error in
             XCTAssertEqual(
                 error as? AppUpdaterError,
-                .invalidArchiveEntry("/tmp/evil.app/Contents/MacOS/evil")
+                .resourceLimitExceeded("mounted entry count")
             )
         }
     }
 
-    func testArchiveValidationRejectsParentTraversal() {
+    func testMountedContentInspectionEnforcesSizeLimit() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data(repeating: 0, count: 5).write(
+            to: root.appendingPathComponent("large")
+        )
+
         XCTAssertThrowsError(
-            try ArchiveExtractor.validate(entries: ["App.app/../evil"])
+            try ArchiveExtractor.inspect(
+                root,
+                limits: .init(
+                    .init(maximumMountedBytes: 4, maximumEntries: 10)
+                )
+            )
         ) { error in
             XCTAssertEqual(
                 error as? AppUpdaterError,
-                .invalidArchiveEntry("App.app/../evil")
+                .resourceLimitExceeded("mounted content size")
             )
         }
-    }
-
-    func testArchiveValidationAllowsNormalBundleEntries() throws {
-        XCTAssertNoThrow(
-            try ArchiveExtractor.validate(
-                entries: ["AppUpdater.app/Contents/MacOS/AppUpdater"]
-            )
-        )
-    }
-
-    func testArchiveValidationRejectsEmptyArchives() {
-        XCTAssertThrowsError(try ArchiveExtractor.validate(entries: [])) { error in
-            XCTAssertEqual(error as? AppUpdaterError, .invalidDownloadedBundle)
-        }
-    }
-
-    func testArchiveExtractorExtractsZipWithSingleApp() async throws {
-        let root = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
-
-        let source = root.appendingPathComponent("source", isDirectory: true)
-        try makeApp(named: "AppUpdater.app", in: source)
-
-        let archive = root.appendingPathComponent("AppUpdater.zip")
-        _ = try await ProcessRunner.run(
-            URL(fileURLWithPath: "/usr/bin/zip"),
-            arguments: [
-                "-qry",
-                archive.path,
-                "AppUpdater.app",
-            ],
-            currentDirectory: source
-        )
-
-        let extractedApp = try await ArchiveExtractor.extract(
-            archive,
-            contentType: .zip,
-            into: root
-        )
-
-        XCTAssertEqual(extractedApp.lastPathComponent, "AppUpdater.app")
-    }
-
-    func testArchiveExtractorExtractsTarWithSingleApp() async throws {
-        let root = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
-
-        let source = root.appendingPathComponent("source", isDirectory: true)
-        try makeApp(named: "AppUpdater.app", in: source)
-
-        let archive = root.appendingPathComponent("AppUpdater.tar.gz")
-        _ = try await ProcessRunner.run(
-            URL(fileURLWithPath: "/usr/bin/tar"),
-            arguments: [
-                "-czf",
-                archive.path,
-                "-C",
-                source.path,
-                "AppUpdater.app",
-            ]
-        )
-
-        let extractedApp = try await ArchiveExtractor.extract(
-            archive,
-            contentType: .tar,
-            into: root
-        )
-
-        XCTAssertEqual(extractedApp.lastPathComponent, "AppUpdater.app")
     }
 
     func testArchiveExtractorExtractsDiskImageWithSingleApp() async throws {
@@ -609,63 +567,6 @@ final class AppUpdaterTests: XCTestCase {
         }
     }
 
-    func testArchiveExtractorRejectsArchiveWithoutApp() async throws {
-        let root = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
-
-        let source = root.appendingPathComponent("source", isDirectory: true)
-        try FileManager.default.createDirectory(
-            at: source,
-            withIntermediateDirectories: true
-        )
-        try Data("hello".utf8).write(to: source.appendingPathComponent("README"))
-
-        let archive = root.appendingPathComponent("NoApp.zip")
-        _ = try await ProcessRunner.run(
-            URL(fileURLWithPath: "/usr/bin/zip"),
-            arguments: ["-qry", archive.path, "README"],
-            currentDirectory: source
-        )
-
-        do {
-            _ = try await ArchiveExtractor.extract(
-                archive,
-                contentType: .zip,
-                into: root
-            )
-            XCTFail("extract should throw")
-        } catch {
-            XCTAssertEqual(error as? AppUpdaterError, .invalidDownloadedBundle)
-        }
-    }
-
-    func testArchiveExtractorRejectsArchiveWithMultipleApps() async throws {
-        let root = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
-
-        let source = root.appendingPathComponent("source", isDirectory: true)
-        try makeApp(named: "One.app", in: source)
-        try makeApp(named: "Two.app", in: source)
-
-        let archive = root.appendingPathComponent("MultipleApps.zip")
-        _ = try await ProcessRunner.run(
-            URL(fileURLWithPath: "/usr/bin/zip"),
-            arguments: ["-qry", archive.path, "One.app", "Two.app"],
-            currentDirectory: source
-        )
-
-        do {
-            _ = try await ArchiveExtractor.extract(
-                archive,
-                contentType: .zip,
-                into: root
-            )
-            XCTFail("extract should throw")
-        } catch {
-            XCTAssertEqual(error as? AppUpdaterError, .invalidDownloadedBundle)
-        }
-    }
-
     func testProcessRunnerCapturesStdout() async throws {
         let output = try await ProcessRunner.run(
             URL(fileURLWithPath: "/bin/echo"),
@@ -701,6 +602,19 @@ final class AppUpdaterTests: XCTestCase {
             XCTFail("process should throw")
         } catch {
             XCTAssertNotNil(error)
+        }
+    }
+
+    func testProcessRunnerTimesOut() async throws {
+        do {
+            _ = try await ProcessRunner.run(
+                URL(fileURLWithPath: "/bin/sleep"),
+                arguments: ["1"],
+                timeout: 0.01
+            )
+            XCTFail("process should time out")
+        } catch {
+            XCTAssertEqual(error as? AppUpdaterError, .operationTimedOut)
         }
     }
 
@@ -812,7 +726,7 @@ final class AppUpdaterTests: XCTestCase {
         let launcher = LauncherRecorder()
         let terminator = TerminatorRecorder()
         let update = Update(
-            assetName: "AppUpdater-2.0.0.zip",
+            assetName: "AppUpdater-2.0.0.dmg",
             stagedBundleURL: root.appendingPathComponent("Staged.app"),
             installedBundleURL: URL(fileURLWithPath: "/Applications/AppUpdater.app"),
             executableURL: URL(fileURLWithPath: "/Applications/AppUpdater.app/Contents/MacOS/AppUpdater"),
@@ -842,7 +756,7 @@ final class AppUpdaterTests: XCTestCase {
         _ version: String,
         prerelease: Bool,
         assetName: String,
-        contentType: String = "application/zip"
+        contentType: String = "application/x-apple-diskimage"
     ) throws -> Release {
         let json = """
         {
@@ -852,7 +766,8 @@ final class AppUpdaterTests: XCTestCase {
             {
               "name": "\(assetName)",
               "browser_download_url": "https://example.com/\(assetName)",
-              "content_type": "\(contentType)"
+              "content_type": "\(contentType)",
+              "size": 42
             }
           ]
         }
@@ -986,15 +901,17 @@ private final class TerminatorRecorder: @unchecked Sendable {
 private final class URLProtocolStub: URLProtocol, @unchecked Sendable {
     private nonisolated(unsafe) static var body = Data()
     private nonisolated(unsafe) static var recordedRequests: [URLRequest] = []
+    private nonisolated(unsafe) static var responseURL: URL?
 
     static var requests: [URLRequest] {
         recordedRequests
     }
 
-    static func configure(statusCode: Int, body: String) {
+    static func configure(statusCode: Int, body: String, responseURL: URL?) {
         self.body = Data(body.utf8)
         recordedRequests = []
         self.statusCode = statusCode
+        self.responseURL = responseURL
     }
 
     private nonisolated(unsafe) static var statusCode = 200
@@ -1010,7 +927,7 @@ private final class URLProtocolStub: URLProtocol, @unchecked Sendable {
     override func startLoading() {
         Self.recordedRequests.append(request)
         let response = HTTPURLResponse(
-            url: request.url!,
+            url: Self.responseURL ?? request.url!,
             statusCode: Self.statusCode,
             httpVersion: nil,
             headerFields: nil
@@ -1024,15 +941,23 @@ private final class URLProtocolStub: URLProtocol, @unchecked Sendable {
 }
 
 private extension URLSession {
-    static func stubbed(statusCode: Int, body: String) -> URLSession {
-        URLProtocolStub.configure(statusCode: statusCode, body: body)
+    static func stubbed(
+        statusCode: Int,
+        body: String,
+        responseURL: URL? = nil
+    ) -> URLSession {
+        URLProtocolStub.configure(
+            statusCode: statusCode,
+            body: body,
+            responseURL: responseURL
+        )
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [URLProtocolStub.self]
         return URLSession(configuration: configuration)
     }
 }
 
-private func stagedUpdate(assetName: String = "AppUpdater-2.0.0.zip") -> Update {
+private func stagedUpdate(assetName: String = "AppUpdater-2.0.0.dmg") -> Update {
     Update(
         assetName: assetName,
         stagedBundleURL: URL(fileURLWithPath: "/tmp/staged/AppUpdater.app"),
