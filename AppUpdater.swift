@@ -1088,19 +1088,60 @@ enum ApplicationLauncher {
                 application.activate()
                 return true
             },
+            armFallback: { processIdentifier in
+                try armFallback(
+                    oldProcessIdentifier: getpid(),
+                    newProcessIdentifier: processIdentifier,
+                    applicationURL: url
+                )
+            },
             pause: { try await Task.sleep(nanoseconds: 50_000_000) }
         )
+    }
+
+    private static func armFallback(
+        oldProcessIdentifier: pid_t,
+        newProcessIdentifier: pid_t,
+        applicationURL: URL
+    ) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = [
+            "-c",
+            """
+            i=0
+            while kill -0 "$1" 2>/dev/null && [ "$i" -lt 600 ]; do
+                /bin/sleep 0.05
+                i=$((i + 1))
+            done
+            kill -0 "$1" 2>/dev/null && exit 0
+            /bin/sleep 0.2
+            kill -0 "$2" 2>/dev/null || exec /usr/bin/open -n "$3"
+            """,
+            "app-updater-relauncher",
+            String(oldProcessIdentifier),
+            String(newProcessIdentifier),
+            applicationURL.path,
+        ]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
     }
 
     static func launchNewInstance(
         attempts: Int = 200,
         spawn: () throws -> pid_t,
         isReady: (pid_t) -> Bool,
+        armFallback: (pid_t) throws -> Void = { _ in },
         pause: () async throws -> Void
     ) async throws {
         let processIdentifier = try spawn()
         for _ in 0..<attempts {
-            if isReady(processIdentifier) { return }
+            if isReady(processIdentifier) {
+                try armFallback(processIdentifier)
+                return
+            }
             try await pause()
         }
         throw AppUpdaterError.relaunchFailed

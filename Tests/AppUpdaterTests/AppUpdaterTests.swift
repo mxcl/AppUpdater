@@ -919,6 +919,7 @@ final class AppUpdaterTests: XCTestCase {
     func testRelaunchWaitsForSpawnedProcess() async throws {
         var samples = [false, false, true]
         var launches = 0
+        var protectedProcessIdentifier: pid_t?
         try await ApplicationLauncher.launchNewInstance(
             attempts: 3,
             spawn: {
@@ -929,9 +930,11 @@ final class AppUpdaterTests: XCTestCase {
                 XCTAssertEqual(processIdentifier, 42)
                 return samples.removeFirst()
             },
+            armFallback: { protectedProcessIdentifier = $0 },
             pause: {}
         )
         XCTAssertEqual(launches, 1)
+        XCTAssertEqual(protectedProcessIdentifier, 42)
     }
 
     @MainActor
