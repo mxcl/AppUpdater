@@ -183,7 +183,7 @@ public final class AppUpdater {
                 throw AppUpdaterError.invalidDownloadedBundle
             }
 
-            try CodeSignature.requireSameSigner(
+            try CodeSignature.requireSameDeveloperID(
                 current: installedAppBundle,
                 candidate: downloadedAppBundle
             )
@@ -279,7 +279,9 @@ public enum AppUpdaterError: LocalizedError, Equatable {
     case invalidGitHubResponse
     case insecureDownloadURL
     case invalidHTTPResponse
+    case invalidDeveloperID
     case missingCodeSigningInfo
+    case mismatchedBundleIdentifier
     case mismatchedCodeSigningInfo
     case operationTimedOut
     case processFailed(URL, Int32, String)
@@ -303,8 +305,12 @@ public enum AppUpdaterError: LocalizedError, Equatable {
             "The release asset download URL is not HTTPS."
         case .invalidHTTPResponse:
             "The server returned an invalid or insecure response."
+        case .invalidDeveloperID:
+            "An app is not signed with a valid Developer ID Application identity."
         case .missingCodeSigningInfo:
             "A bundle is missing required code-signing information."
+        case .mismatchedBundleIdentifier:
+            "The downloaded app has a different bundle identifier."
         case .mismatchedCodeSigningInfo:
             "The downloaded app was signed by a different identity."
         case .operationTimedOut:
@@ -717,23 +723,86 @@ enum ArchiveExtractor {
 }
 
 enum CodeSignature {
-    static func requireSameSigner(current: Bundle, candidate: Bundle) throws {
+    struct Identity: Equatable, Sendable {
+        let teamIdentifier: String
+        let signingIdentifier: String
+        let bundleIdentifier: String
+    }
+
+    static func requireSameDeveloperID(
+        current: Bundle,
+        candidate: Bundle
+    ) throws {
         let currentCode = try staticCode(for: current)
         let candidateCode = try staticCode(for: candidate)
+        let requirement = try developerIDRequirement()
 
-        try checkValidity(of: currentCode, requirement: nil)
+        try checkValidity(of: currentCode, requirement: requirement)
+        try checkValidity(of: candidateCode, requirement: requirement)
+        try requireMatch(
+            current: try identity(of: currentCode, bundle: current),
+            candidate: try identity(of: candidateCode, bundle: candidate)
+        )
+    }
 
+    static func requireMatch(current: Identity, candidate: Identity) throws {
+        guard current.bundleIdentifier == candidate.bundleIdentifier else {
+            throw AppUpdaterError.mismatchedBundleIdentifier
+        }
+        guard current.teamIdentifier == candidate.teamIdentifier,
+              current.signingIdentifier == candidate.signingIdentifier
+        else {
+            throw AppUpdaterError.mismatchedCodeSigningInfo
+        }
+    }
+
+    static func validateStructure(of bundle: Bundle) throws {
+        try checkValidity(of: staticCode(for: bundle), requirement: nil)
+    }
+
+    private static func developerIDRequirement() throws -> SecRequirement {
+        let source = """
+        anchor apple generic and \
+        certificate 1[field.1.2.840.113635.100.6.2.6] and \
+        certificate leaf[field.1.2.840.113635.100.6.1.13]
+        """ as CFString
         var requirement: SecRequirement?
-        let status = SecCodeCopyDesignatedRequirement(
-            currentCode,
+        let status = SecRequirementCreateWithString(
+            source,
             SecCSFlags(),
             &requirement
         )
         guard status == errSecSuccess, let requirement else {
             throw AppUpdaterError.missingCodeSigningInfo
         }
+        return requirement
+    }
 
-        try checkValidity(of: candidateCode, requirement: requirement)
+    private static func identity(
+        of staticCode: SecStaticCode,
+        bundle: Bundle
+    ) throws -> Identity {
+        var information: CFDictionary?
+        let status = SecCodeCopySigningInformation(
+            staticCode,
+            SecCSFlags(rawValue: kSecCSSigningInformation),
+            &information
+        )
+        guard status == errSecSuccess,
+              let information = information as? [CFString: Any],
+              let teamIdentifier = information[kSecCodeInfoTeamIdentifier]
+                as? String,
+              let signingIdentifier = information[kSecCodeInfoIdentifier]
+                as? String,
+              let bundleIdentifier = bundle.bundleIdentifier
+        else {
+            throw AppUpdaterError.missingCodeSigningInfo
+        }
+        return Identity(
+            teamIdentifier: teamIdentifier,
+            signingIdentifier: signingIdentifier,
+            bundleIdentifier: bundleIdentifier
+        )
     }
 
     private static func staticCode(for bundle: Bundle) throws -> SecStaticCode {
@@ -757,6 +826,8 @@ enum CodeSignature {
             rawValue: kSecCSStrictValidate
                 | kSecCSCheckAllArchitectures
                 | kSecCSCheckNestedCode
+                | kSecCSRestrictSymlinks
+                | kSecCSRestrictToAppLike
         )
         var error: Unmanaged<CFError>?
         let status = SecStaticCodeCheckValidityWithErrors(
@@ -767,7 +838,7 @@ enum CodeSignature {
         )
         guard status == errSecSuccess else {
             _ = error?.takeRetainedValue()
-            throw AppUpdaterError.mismatchedCodeSigningInfo
+            throw AppUpdaterError.invalidDeveloperID
         }
     }
 }

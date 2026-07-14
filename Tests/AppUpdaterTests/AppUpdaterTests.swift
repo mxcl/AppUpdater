@@ -618,6 +618,117 @@ final class AppUpdaterTests: XCTestCase {
         }
     }
 
+    func testCodeSignatureRejectsBroadAdHocRequirement() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let current = try makeBundle(named: "Current", version: "1.0", in: root)
+        let candidate = try makeBundle(named: "Candidate", version: "2.0", in: root)
+        _ = try await ProcessRunner.run(
+            URL(fileURLWithPath: "/usr/bin/codesign"),
+            arguments: ["-f", "-s", "-", "-r=designated => true", current.bundlePath]
+        )
+        _ = try await ProcessRunner.run(
+            URL(fileURLWithPath: "/usr/bin/codesign"),
+            arguments: ["-f", "-s", "-", candidate.bundlePath]
+        )
+
+        XCTAssertThrowsError(
+            try CodeSignature.requireSameDeveloperID(
+                current: current,
+                candidate: candidate
+            )
+        ) { error in
+            XCTAssertEqual(error as? AppUpdaterError, .invalidDeveloperID)
+        }
+    }
+
+    func testCodeSignatureRequiresMatchingIdentityFields() throws {
+        let identity = CodeSignature.Identity(
+            teamIdentifier: "TEAM",
+            signingIdentifier: "dev.mxcl.App",
+            bundleIdentifier: "dev.mxcl.App"
+        )
+
+        XCTAssertThrowsError(
+            try CodeSignature.requireMatch(
+                current: identity,
+                candidate: .init(
+                    teamIdentifier: "OTHER",
+                    signingIdentifier: identity.signingIdentifier,
+                    bundleIdentifier: identity.bundleIdentifier
+                )
+            )
+        ) { error in
+            XCTAssertEqual(error as? AppUpdaterError, .mismatchedCodeSigningInfo)
+        }
+        XCTAssertThrowsError(
+            try CodeSignature.requireMatch(
+                current: identity,
+                candidate: .init(
+                    teamIdentifier: identity.teamIdentifier,
+                    signingIdentifier: "dev.mxcl.Other",
+                    bundleIdentifier: identity.bundleIdentifier
+                )
+            )
+        ) { error in
+            XCTAssertEqual(error as? AppUpdaterError, .mismatchedCodeSigningInfo)
+        }
+        XCTAssertThrowsError(
+            try CodeSignature.requireMatch(
+                current: identity,
+                candidate: .init(
+                    teamIdentifier: identity.teamIdentifier,
+                    signingIdentifier: identity.signingIdentifier,
+                    bundleIdentifier: "dev.mxcl.Other"
+                )
+            )
+        ) { error in
+            XCTAssertEqual(error as? AppUpdaterError, .mismatchedBundleIdentifier)
+        }
+    }
+
+    func testCodeSignatureRejectsModifiedNestedCode() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let bundle = try makeBundle(named: "Current", version: "1.0", in: root)
+        let nested = bundle.bundleURL
+            .appendingPathComponent("Contents/MacOS/Nested")
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: nested)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: nested.path
+        )
+        _ = try await ProcessRunner.run(
+            URL(fileURLWithPath: "/usr/bin/codesign"),
+            arguments: ["-f", "-s", "-", "--deep", bundle.bundlePath]
+        )
+        try Data("#!/bin/sh\nexit 1\n".utf8).write(to: nested)
+
+        XCTAssertThrowsError(try CodeSignature.validateStructure(of: bundle))
+    }
+
+    func testCodeSignatureRejectsUnsafeSymlink() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let bundle = try makeBundle(named: "Current", version: "1.0", in: root)
+        let resources = bundle.bundleURL
+            .appendingPathComponent("Contents/Resources", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: resources,
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createSymbolicLink(
+            at: resources.appendingPathComponent("outside"),
+            withDestinationURL: URL(fileURLWithPath: "/tmp")
+        )
+        _ = try await ProcessRunner.run(
+            URL(fileURLWithPath: "/usr/bin/codesign"),
+            arguments: ["-f", "-s", "-", bundle.bundlePath]
+        )
+
+        XCTAssertThrowsError(try CodeSignature.validateStructure(of: bundle))
+    }
+
     func testErrorDescriptions() {
         let errors: [AppUpdaterError] = [
             .bundleExecutableURL,
@@ -815,7 +926,12 @@ final class AppUpdaterTests: XCTestCase {
             at: executableDirectory,
             withIntermediateDirectories: true
         )
-        try Data().write(to: executableDirectory.appendingPathComponent(name))
+        let executable = executableDirectory.appendingPathComponent(name)
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: executable)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: executable.path
+        )
     }
 
     private func makeBundle(named name: String, version: String, in directory: URL) throws -> Bundle {
@@ -823,7 +939,12 @@ final class AppUpdaterTests: XCTestCase {
         let contents = app.appendingPathComponent("Contents", isDirectory: true)
         let executableDirectory = contents.appendingPathComponent("MacOS", isDirectory: true)
         try FileManager.default.createDirectory(at: executableDirectory, withIntermediateDirectories: true)
-        try Data().write(to: executableDirectory.appendingPathComponent(name))
+        let executable = executableDirectory.appendingPathComponent(name)
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: executable)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: executable.path
+        )
         let info: [String: Any] = [
             "CFBundleExecutable": name,
             "CFBundleIdentifier": "dev.mxcl.\(name.lowercased())",
