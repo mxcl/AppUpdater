@@ -1088,10 +1088,9 @@ enum ApplicationLauncher {
                 application.activate()
                 return true
             },
-            armFallback: { processIdentifier in
+            armFallback: { _ in
                 try armFallback(
                     oldProcessIdentifier: getpid(),
-                    newProcessIdentifier: processIdentifier,
                     applicationURL: url
                 )
             },
@@ -1101,7 +1100,6 @@ enum ApplicationLauncher {
 
     private static func armFallback(
         oldProcessIdentifier: pid_t,
-        newProcessIdentifier: pid_t,
         applicationURL: URL
     ) throws {
         let process = Process()
@@ -1115,12 +1113,11 @@ enum ApplicationLauncher {
                 i=$((i + 1))
             done
             kill -0 "$1" 2>/dev/null && exit 0
-            /bin/sleep 0.2
-            kill -0 "$2" 2>/dev/null || exec /usr/bin/open -n "$3"
+            /bin/sleep 1
+            exec /usr/bin/open "$2"
             """,
             "app-updater-relauncher",
             String(oldProcessIdentifier),
-            String(newProcessIdentifier),
             applicationURL.path,
         ]
         process.standardInput = FileHandle.nullDevice
