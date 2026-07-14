@@ -1060,14 +1060,24 @@ struct InstallationDriver {
 @MainActor
 enum ApplicationLauncher {
     static func launchNewInstance(at url: URL) async throws {
-        guard let identifier = Bundle(url: url)?.bundleIdentifier else {
+        guard let bundle = Bundle(url: url),
+              let identifier = bundle.bundleIdentifier,
+              let executableURL = bundle.executableURL?.resolvingSymlinksInPath()
+        else {
             throw AppUpdaterError.invalidDownloadedBundle
         }
         try await launchNewInstance(
             runningProcessIdentifiers: {
                 Set(NSRunningApplication.runningApplications(
                     withBundleIdentifier: identifier
-                ).map(\.processIdentifier))
+                ).compactMap { application in
+                    guard !application.isTerminated,
+                          application.isFinishedLaunching,
+                          application.processIdentifier > 0,
+                          application.executableURL?.resolvingSymlinksInPath() == executableURL
+                    else { return nil }
+                    return application.processIdentifier
+                })
             },
             forceLaunch: {
                 _ = try await ProcessRunner.run(
