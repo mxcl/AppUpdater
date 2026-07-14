@@ -759,108 +759,213 @@ final class AppUpdaterTests: XCTestCase {
         }
     }
 
-    func testInstallerHelperWritesExecutableArgumentDrivenScript() throws {
-        let root = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
-
-        let scriptURL = try InstallerHelper.writeScript(in: root)
-        let script = try String(contentsOf: scriptURL, encoding: .utf8)
-        let permissions = try FileManager.default.attributesOfItem(
-            atPath: scriptURL.path
-        )[.posixPermissions] as? Int
-
-        XCTAssertTrue(script.hasPrefix("#!/bin/sh"))
-        XCTAssertTrue(script.contains("staged_bundle=\"$2\""))
-        XCTAssertTrue(script.contains("installed_bundle=\"$3\""))
-        XCTAssertTrue(script.contains("executable=\"$4\""))
-        XCTAssertTrue(script.contains("deadline=$(( $(date +%s) + 300 ))"))
-        XCTAssertTrue(script.contains("if [ -w \"$installed_parent\" ] && { [ ! -e \"$installed_bundle\" ] || [ -w \"$installed_bundle\" ]; }; then"))
-        XCTAssertTrue(script.contains("/usr/bin/osascript - \"$staged_bundle\" \"$installed_parent\""))
-        XCTAssertTrue(script.contains("tell application \"Finder\" to move stagedBundle to destinationFolder with replacing"))
-        XCTAssertEqual(permissions, 0o700)
-    }
-
-    func testInstallerHelperInstallsIntoWritableDirectory() async throws {
-        let root = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
-
-        let stagingDirectory = root.appendingPathComponent("staging", isDirectory: true)
-        let installedParent = root.appendingPathComponent("Applications", isDirectory: true)
-        let stagedBundle = stagingDirectory.appendingPathComponent("AppUpdater.app", isDirectory: true)
-        let installedBundle = installedParent.appendingPathComponent("AppUpdater.app", isDirectory: true)
-        let executable = installedBundle
-            .appendingPathComponent("Contents", isDirectory: true)
-            .appendingPathComponent("MacOS", isDirectory: true)
-            .appendingPathComponent("AppUpdater")
-        let stagedExecutable = stagedBundle
-            .appendingPathComponent("Contents", isDirectory: true)
-            .appendingPathComponent("MacOS", isDirectory: true)
-            .appendingPathComponent("AppUpdater")
-
-        try FileManager.default.createDirectory(at: stagingDirectory, withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(at: installedParent, withIntermediateDirectories: true)
-        try makeApp(named: "AppUpdater.app", in: stagingDirectory)
-        try makeApp(named: "AppUpdater.app", in: installedParent)
-        try "new".write(to: stagedBundle.appendingPathComponent("marker"), atomically: true, encoding: .utf8)
-        try "old".write(to: installedBundle.appendingPathComponent("marker"), atomically: true, encoding: .utf8)
-        try "#!/bin/sh\nexit 0\n".write(to: stagedExecutable, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: stagedExecutable.path)
-
-        let finishedProcess = Process()
-        finishedProcess.executableURL = URL(fileURLWithPath: "/usr/bin/true")
-        try finishedProcess.run()
-        finishedProcess.waitUntilExit()
-
-        let scriptURL = try InstallerHelper.writeScript(in: stagingDirectory)
-        _ = try await ProcessRunner.run(
-            scriptURL,
-            arguments: [
-                "\(finishedProcess.processIdentifier)",
-                stagedBundle.path,
-                installedBundle.path,
-                executable.path,
-                stagingDirectory.path,
-            ]
+    @MainActor
+    func testUpdateAndPreparedUpdateAreOneShot() async throws {
+        var installs = 0
+        let update = Update(
+            assetName: "AppUpdater-2.0.0.dmg",
+            prepare: {
+                PreparedUpdate(
+                    assetName: "AppUpdater-2.0.0.dmg",
+                    install: { installs += 1 },
+                    discard: {}
+                )
+            },
+            discard: {}
         )
 
-        XCTAssertFalse(FileManager.default.fileExists(atPath: stagingDirectory.path))
+        let prepared = try await update.prepareInstallation()
+        try await prepared.installAndRelaunch()
+        XCTAssertEqual(installs, 1)
+        await XCTAssertThrowsErrorAsync(try await update.prepareInstallation())
+        await XCTAssertThrowsErrorAsync(try await prepared.installAndRelaunch())
+    }
+
+    @MainActor
+    func testReplacementTransactionLaunchesBeforeCleanupAndTermination() async throws {
+        var events: [String] = []
+        let prepared = preparedInstallation(
+            driver: transactionDriver(events: { events.append($0) }),
+            cleanup: { events.append("cleanup") }
+        )
+
+        try await prepared.installAndRelaunch()
+
+        XCTAssertEqual(events, [
+            "validate", "validate", "replace", "validate", "launch",
+            "cleanup", "remove", "remove", "terminate",
+        ])
+    }
+
+    @MainActor
+    func testInstalledValidationFailureRollsBack() async throws {
+        var validations = 0
+        var events: [String] = []
+        var driver = transactionDriver(events: { events.append($0) })
+        driver.validate = { _, _ in
+            validations += 1
+            events.append("validate")
+            if validations == 3 { throw AppUpdaterError.invalidDeveloperID }
+        }
+        let prepared = preparedInstallation(driver: driver)
+
+        await XCTAssertThrowsErrorAsync(try await prepared.installAndRelaunch())
+
+        XCTAssertEqual(events, [
+            "validate", "validate", "replace", "validate", "restore",
+        ])
+    }
+
+    @MainActor
+    func testLaunchFailureRollsBackWithoutTerminating() async throws {
+        var events: [String] = []
+        var driver = transactionDriver(events: { events.append($0) })
+        driver.launch = { _ in
+            events.append("launch")
+            throw AppUpdaterError.invalidUpdateState
+        }
+        let prepared = preparedInstallation(driver: driver)
+
+        await XCTAssertThrowsErrorAsync(try await prepared.installAndRelaunch())
+
+        XCTAssertEqual(events, [
+            "validate", "validate", "replace", "validate", "launch", "restore",
+        ])
+    }
+
+    @MainActor
+    func testRollbackFailureIsReportedExplicitly() async throws {
+        var validations = 0
+        var driver = transactionDriver(events: { _ in })
+        driver.validate = { _, _ in
+            validations += 1
+            if validations == 3 { throw AppUpdaterError.invalidDeveloperID }
+        }
+        driver.restore = { _, _, _ in throw CocoaError(.fileWriteNoPermission) }
+        let prepared = preparedInstallation(driver: driver)
+
+        do {
+            try await prepared.installAndRelaunch()
+            XCTFail("installation should throw")
+        } catch {
+            XCTAssertEqual(error as? AppUpdaterError, .rollbackFailed)
+        }
+    }
+
+    @MainActor
+    func testWritableReplacementRestoresBackupWhenCopyFails() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let installed = root.appendingPathComponent("App.app", isDirectory: true)
+        let missingCandidate = root.appendingPathComponent("Missing.app", isDirectory: true)
+        let backup = root.appendingPathComponent(".app-updater-backup-00000000-0000-0000-0000-000000000000.app")
+        try FileManager.default.createDirectory(at: installed, withIntermediateDirectories: true)
+        try Data("old".utf8).write(to: installed.appendingPathComponent("marker"))
+
+        await XCTAssertThrowsErrorAsync(
+            try await InstallationDriver.live.replace(
+                missingCandidate, installed, backup, false
+            )
+        )
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: installed.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: backup.path))
         XCTAssertEqual(
-            try String(contentsOf: installedBundle.appendingPathComponent("marker"), encoding: .utf8),
-            "new"
+            try String(contentsOf: installed.appendingPathComponent("marker"), encoding: .utf8),
+            "old"
         )
     }
 
     @MainActor
-    func testInstallAndRelaunchWritesHelperAndLaunchesIt() async throws {
+    func testPromotionCopyIsIndependentOfOriginalDMG() async throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
-        let launcher = LauncherRecorder()
-        let terminator = TerminatorRecorder()
-        let update = Update(
-            assetName: "AppUpdater-2.0.0.dmg",
-            stagedBundleURL: root.appendingPathComponent("Staged.app"),
-            installedBundleURL: URL(fileURLWithPath: "/Applications/AppUpdater.app"),
-            executableURL: URL(fileURLWithPath: "/Applications/AppUpdater.app/Contents/MacOS/AppUpdater"),
-            stagingDirectoryURL: root,
-            relauncher: { scriptURL, arguments in
-                launcher.record(scriptURL: scriptURL, arguments: arguments)
-            },
-            terminator: {
-                terminator.record()
-            }
+        let source = root.appendingPathComponent("source.dmg")
+        let destination = root.appendingPathComponent("promoted.dmg")
+        try Data("validated".utf8).write(to: source)
+
+        try await InstallationDriver.live.promote(source, destination, false)
+        try Data("attacker".utf8).write(to: source)
+
+        XCTAssertEqual(try Data(contentsOf: destination), Data("validated".utf8))
+    }
+
+    func testProtectedPromotionRejectsUserOwnedFileEvenWhenReadOnly() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let image = root.appendingPathComponent(".app-updater-00000000-0000-0000-0000-000000000000.dmg")
+        try Data().write(to: image)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o400],
+            ofItemAtPath: image.path
         )
 
-        try await update.installAndRelaunch()
+        XCTAssertThrowsError(
+            try Installation.validatePromotion(
+                image,
+                expectedParent: root,
+                protected: true
+            )
+        ) { error in
+            XCTAssertEqual(error as? AppUpdaterError, .unsafeInstallationState)
+        }
+    }
 
-        let launch = launcher.launch()
-        XCTAssertEqual(launch?.scriptURL.lastPathComponent, "install-update.sh")
-        XCTAssertEqual(launch?.arguments.dropFirst(), [
-            update.stagedBundleURL.path,
-            update.installedBundleURL.path,
-            update.executableURL.path,
-            root.path,
-        ])
-        XCTAssertTrue(terminator.wasCalled())
+    func testStaleCleanupRecognizesOnlyOwnedRegularNames() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let owned = root.appendingPathComponent(
+            ".app-updater-00000000-0000-0000-0000-000000000000.dmg"
+        )
+        let lookalike = root.appendingPathComponent(".app-updater-important.dmg")
+        try Data().write(to: owned)
+        try Data().write(to: lookalike)
+
+        XCTAssertTrue(Installation.ownsStaleItem(owned))
+        XCTAssertFalse(Installation.ownsStaleItem(lookalike))
+
+        let symlink = root.appendingPathComponent(
+            ".app-updater-11111111-1111-1111-1111-111111111111.dmg"
+        )
+        try FileManager.default.createSymbolicLink(at: symlink, withDestinationURL: owned)
+        XCTAssertFalse(Installation.ownsStaleItem(symlink))
+    }
+
+    @MainActor
+    private func preparedInstallation(
+        driver: InstallationDriver,
+        cleanup: @escaping () async -> Void = {}
+    ) -> PreparedUpdate {
+        let identity = CodeSignature.Identity(
+            teamIdentifier: "TEAM",
+            signingIdentifier: "dev.mxcl.App",
+            bundleIdentifier: "dev.mxcl.App"
+        )
+        return PreparedInstallation(
+            assetName: "App-2.0.0.dmg",
+            installedURL: URL(fileURLWithPath: "/Applications/App.app"),
+            candidateURL: URL(fileURLWithPath: "/Volumes/Update/App.app"),
+            promotedImageURL: URL(fileURLWithPath: "/Applications/.app-updater-00000000-0000-0000-0000-000000000000.dmg"),
+            expectedIdentity: identity,
+            protected: true,
+            driver: driver,
+            cleanup: cleanup
+        ).publicUpdate()
+    }
+
+    @MainActor
+    private func transactionDriver(
+        events: @escaping (String) -> Void
+    ) -> InstallationDriver {
+        InstallationDriver(
+            promote: { _, _, _ in events("promote") },
+            replace: { _, _, _, _ in events("replace") },
+            restore: { _, _, _ in events("restore") },
+            remove: { _, _ in events("remove") },
+            validate: { _, _ in events("validate") },
+            launch: { _ in events("launch") },
+            terminate: { events("terminate") }
+        )
     }
 
     private func release(
@@ -989,36 +1094,6 @@ private actor AsyncGate {
     }
 }
 
-private final class LauncherRecorder: @unchecked Sendable {
-    private let lock = NSLock()
-    private var recordedLaunch: (scriptURL: URL, arguments: [String])?
-
-    func launch() -> (scriptURL: URL, arguments: [String])? {
-        lock.withLock { recordedLaunch }
-    }
-
-    func record(scriptURL: URL, arguments: [String]) {
-        lock.withLock {
-            recordedLaunch = (scriptURL, arguments)
-        }
-    }
-}
-
-private final class TerminatorRecorder: @unchecked Sendable {
-    private let lock = NSLock()
-    private var called = false
-
-    func wasCalled() -> Bool {
-        lock.withLock { called }
-    }
-
-    func record() {
-        lock.withLock {
-            called = true
-        }
-    }
-}
-
 private final class URLProtocolStub: URLProtocol, @unchecked Sendable {
     private nonisolated(unsafe) static var body = Data()
     private nonisolated(unsafe) static var recordedRequests: [URLRequest] = []
@@ -1078,12 +1153,25 @@ private extension URLSession {
     }
 }
 
+@MainActor
 private func stagedUpdate(assetName: String = "AppUpdater-2.0.0.dmg") -> Update {
     Update(
         assetName: assetName,
-        stagedBundleURL: URL(fileURLWithPath: "/tmp/staged/AppUpdater.app"),
-        installedBundleURL: URL(fileURLWithPath: "/Applications/AppUpdater.app"),
-        executableURL: URL(fileURLWithPath: "/Applications/AppUpdater.app/Contents/MacOS/AppUpdater"),
-        stagingDirectoryURL: URL(fileURLWithPath: "/tmp/staged")
+        prepare: {
+            PreparedUpdate(assetName: assetName, install: {}, discard: {})
+        },
+        discard: {}
     )
+}
+
+@MainActor
+private func XCTAssertThrowsErrorAsync<T>(
+    _ expression: @autoclosure @MainActor () async throws -> T,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) async {
+    do {
+        _ = try await expression()
+        XCTFail("Expected expression to throw", file: file, line: line)
+    } catch {}
 }

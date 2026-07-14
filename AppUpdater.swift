@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 import Security
 import Version
@@ -12,7 +13,7 @@ public final class AppUpdater {
     private let hasExecutable: @Sendable () -> Bool
     private let currentVersion: @Sendable () throws -> Version
     private let fetchReleases: @Sendable () async throws -> [Release]
-    private let stageAsset: @Sendable (Release.Asset) async throws -> Update
+    private let stageAsset: @MainActor @Sendable (Release.Asset) async throws -> Update
 
     public var allowPrereleases = false
 
@@ -75,7 +76,7 @@ public final class AppUpdater {
         hasExecutable: @escaping @Sendable () -> Bool = { true },
         currentVersion: @escaping @Sendable () throws -> Version,
         fetchReleases: @escaping @Sendable () async throws -> [Release],
-        stageAsset: @escaping @Sendable (Release.Asset) async throws -> Update
+        stageAsset: @escaping @MainActor @Sendable (Release.Asset) async throws -> Update
     ) {
         self.owner = owner
         self.repo = repo
@@ -173,37 +174,40 @@ public final class AppUpdater {
                 timeout: configuration.timeout
             )
 
-            let downloadedAppBundleURL = try await ArchiveExtractor.extract(
+            let limits = ArchiveExtractor.Limits(configuration)
+            let mount = try await ArchiveExtractor.mount(
                 downloadURL,
-                contentType: contentType,
-                into: tmpdir,
-                limits: .init(configuration)
+                at: tmpdir.appendingPathComponent("mounted", isDirectory: true),
+                expectedAppName: installedAppBundle.bundleURL.lastPathComponent,
+                limits: limits
             )
-            guard let downloadedAppBundle = Bundle(url: downloadedAppBundleURL) else {
+            guard let downloadedAppBundle = Bundle(url: mount.appURL) else {
+                await mount.discard()
                 throw AppUpdaterError.invalidDownloadedBundle
             }
 
-            try CodeSignature.requireSameDeveloperID(
-                current: installedAppBundle,
-                candidate: downloadedAppBundle
-            )
-
-            guard let executableURL = downloadedAppBundle.executableURL else {
-                throw AppUpdaterError.invalidDownloadedBundle
+            do {
+                try CodeSignature.requireSameDeveloperID(
+                    current: installedAppBundle,
+                    candidate: downloadedAppBundle
+                )
+            } catch {
+                await mount.discard()
+                throw error
             }
-            let relativeExecutablePath = executableURL.path.replacingOccurrences(
-                of: downloadedAppBundle.bundleURL.path + "/",
-                with: ""
-            )
-            let finalExecutableURL = installedAppBundle.bundleURL
-                .appendingPathComponent(relativeExecutablePath)
 
+            let lease = StagingLease(root: tmpdir, mount: mount)
             return Update(
                 assetName: asset.name,
-                stagedBundleURL: downloadedAppBundle.bundleURL,
-                installedBundleURL: installedAppBundle.bundleURL,
-                executableURL: finalExecutableURL,
-                stagingDirectoryURL: tmpdir
+                prepare: {
+                    try await Installation.prepare(
+                        assetName: asset.name,
+                        lease: lease,
+                        installedBundle: installedAppBundle,
+                        limits: limits
+                    )
+                },
+                discard: { await lease.discard() }
             )
         } catch {
             try? FileManager.default.removeItem(at: tmpdir)
@@ -226,48 +230,75 @@ public final class AppUpdater {
     }
 }
 
-public struct Update: Sendable {
-    typealias Relauncher = @Sendable (URL, [String]) throws -> Void
-    typealias Terminator = @MainActor @Sendable () -> Void
+@MainActor
+public final class Update {
+    typealias PrepareOperation = @MainActor () async throws -> PreparedUpdate
+    typealias DiscardOperation = @MainActor () async -> Void
 
     public let assetName: String
-    public let stagedBundleURL: URL
-    public let installedBundleURL: URL
-    public let executableURL: URL
+    private var prepareOperation: PrepareOperation?
+    private var discardOperation: DiscardOperation?
 
-    let stagingDirectoryURL: URL
-    let relauncher: Relauncher
-    let terminator: Terminator
+    public func prepareInstallation() async throws -> PreparedUpdate {
+        guard let operation = prepareOperation else {
+            throw AppUpdaterError.invalidUpdateState
+        }
+        prepareOperation = nil
+        discardOperation = nil
+        return try await operation()
+    }
 
-    @MainActor
-    public func installAndRelaunch() async throws {
-        let helperURL = try InstallerHelper.writeScript(in: stagingDirectoryURL)
-        try relauncher(helperURL, [
-            "\(getpid())",
-            stagedBundleURL.path,
-            installedBundleURL.path,
-            executableURL.path,
-            stagingDirectoryURL.path,
-        ])
-        terminator()
+    public func discard() async {
+        let operation = discardOperation
+        prepareOperation = nil
+        discardOperation = nil
+        await operation?()
     }
 
     init(
         assetName: String,
-        stagedBundleURL: URL,
-        installedBundleURL: URL,
-        executableURL: URL,
-        stagingDirectoryURL: URL,
-        relauncher: @escaping Relauncher = InstallerHelper.launch,
-        terminator: @escaping Terminator = { NSApp.terminate(nil) }
+        prepare: @escaping PrepareOperation,
+        discard: @escaping DiscardOperation
     ) {
         self.assetName = assetName
-        self.stagedBundleURL = stagedBundleURL
-        self.installedBundleURL = installedBundleURL
-        self.executableURL = executableURL
-        self.stagingDirectoryURL = stagingDirectoryURL
-        self.relauncher = relauncher
-        self.terminator = terminator
+        prepareOperation = prepare
+        discardOperation = discard
+    }
+}
+
+@MainActor
+public final class PreparedUpdate {
+    typealias InstallOperation = @MainActor () async throws -> Void
+    typealias DiscardOperation = @MainActor () async -> Void
+
+    public let assetName: String
+    private var installOperation: InstallOperation?
+    private var discardOperation: DiscardOperation?
+
+    public func installAndRelaunch() async throws {
+        guard let operation = installOperation else {
+            throw AppUpdaterError.invalidUpdateState
+        }
+        installOperation = nil
+        discardOperation = nil
+        try await operation()
+    }
+
+    public func discard() async {
+        let operation = discardOperation
+        installOperation = nil
+        discardOperation = nil
+        await operation?()
+    }
+
+    init(
+        assetName: String,
+        install: @escaping InstallOperation,
+        discard: @escaping DiscardOperation
+    ) {
+        self.assetName = assetName
+        installOperation = install
+        discardOperation = discard
     }
 }
 
@@ -279,13 +310,17 @@ public enum AppUpdaterError: LocalizedError, Equatable {
     case invalidGitHubResponse
     case insecureDownloadURL
     case invalidHTTPResponse
+    case invalidUpdateState
     case invalidDeveloperID
     case missingCodeSigningInfo
     case mismatchedBundleIdentifier
     case mismatchedCodeSigningInfo
     case operationTimedOut
+    case promotionFailed
     case processFailed(URL, Int32, String)
     case resourceLimitExceeded(String)
+    case rollbackFailed
+    case unsafeInstallationState
     case unsupportedAsset(String)
     case unsupportedContentType(String)
 
@@ -305,6 +340,8 @@ public enum AppUpdaterError: LocalizedError, Equatable {
             "The release asset download URL is not HTTPS."
         case .invalidHTTPResponse:
             "The server returned an invalid or insecure response."
+        case .invalidUpdateState:
+            "This update operation has already been consumed or discarded."
         case .invalidDeveloperID:
             "An app is not signed with a valid Developer ID Application identity."
         case .missingCodeSigningInfo:
@@ -315,10 +352,16 @@ public enum AppUpdaterError: LocalizedError, Equatable {
             "The downloaded app was signed by a different identity."
         case .operationTimedOut:
             "The update operation timed out."
+        case .promotionFailed:
+            "The DMG could not be promoted into a safe installation boundary."
         case .processFailed(let executable, let status, let stderr):
             "\(executable.path) failed with status \(status): \(stderr)"
         case .resourceLimitExceeded(let resource):
             "The update exceeded the configured \(resource) limit."
+        case .rollbackFailed:
+            "The previous app could not be restored after installation failed."
+        case .unsafeInstallationState:
+            "The installation staging location is writable or unsafe."
         case .unsupportedAsset(let asset):
             "Unsupported release asset: \(asset). Only DMGs are supported."
         case .unsupportedContentType(let contentType):
@@ -585,6 +628,75 @@ enum ArchiveExtractor {
         )
     }
 
+    final class Mount: @unchecked Sendable {
+        let imageURL: URL
+        let mountPoint: URL
+        let appURL: URL
+        private var hold: FileHandle?
+        private let timeout: TimeInterval
+
+        fileprivate init(
+            imageURL: URL,
+            mountPoint: URL,
+            appURL: URL,
+            hold: FileHandle,
+            timeout: TimeInterval
+        ) {
+            self.imageURL = imageURL
+            self.mountPoint = mountPoint
+            self.appURL = appURL
+            self.hold = hold
+            self.timeout = timeout
+        }
+
+        func discard() async {
+            try? hold?.close()
+            hold = nil
+            try? await ArchiveExtractor.detachDiskImage(
+                at: mountPoint,
+                timeout: timeout
+            )
+        }
+    }
+
+    static func mount(
+        _ image: URL,
+        at mountDirectory: URL,
+        expectedAppName: String,
+        limits: Limits
+    ) async throws -> Mount {
+        try FileManager.default.createDirectory(
+            at: mountDirectory,
+            withIntermediateDirectories: true
+        )
+        let mountPoint = try await attachDiskImage(
+            image,
+            at: mountDirectory,
+            timeout: limits.timeout
+        )
+        do {
+            let app = try findSingleApp(in: mountPoint)
+            guard app.lastPathComponent == expectedAppName else {
+                throw AppUpdaterError.invalidDownloadedBundle
+            }
+            try inspect(app, limits: limits)
+            guard let executable = Bundle(url: app)?.executableURL else {
+                throw AppUpdaterError.invalidDownloadedBundle
+            }
+            let hold = try FileHandle(forReadingFrom: executable)
+            return Mount(
+                imageURL: image,
+                mountPoint: mountPoint,
+                appURL: app,
+                hold: hold,
+                timeout: limits.timeout
+            )
+        } catch {
+            try? await detachDiskImage(at: mountPoint, timeout: limits.timeout)
+            throw error
+        }
+    }
+
     private static func extractDiskImage(
         _ url: URL,
         into extractionDirectory: URL,
@@ -733,16 +845,16 @@ enum CodeSignature {
         current: Bundle,
         candidate: Bundle
     ) throws {
-        let currentCode = try staticCode(for: current)
-        let candidateCode = try staticCode(for: candidate)
-        let requirement = try developerIDRequirement()
-
-        try checkValidity(of: currentCode, requirement: requirement)
-        try checkValidity(of: candidateCode, requirement: requirement)
         try requireMatch(
-            current: try identity(of: currentCode, bundle: current),
-            candidate: try identity(of: candidateCode, bundle: candidate)
+            current: try validatedIdentity(of: current),
+            candidate: try validatedIdentity(of: candidate)
         )
+    }
+
+    static func validatedIdentity(of bundle: Bundle) throws -> Identity {
+        let code = try staticCode(for: bundle)
+        try checkValidity(of: code, requirement: developerIDRequirement())
+        return try identity(of: code, bundle: bundle)
     }
 
     static func requireMatch(current: Identity, candidate: Identity) throws {
@@ -843,72 +955,399 @@ enum CodeSignature {
     }
 }
 
-enum InstallerHelper {
-    static func launch(scriptURL: URL, arguments: [String]) throws {
-        let process = Process()
-        process.executableURL = scriptURL
-        process.arguments = arguments
-        try process.run()
+@MainActor
+final class StagingLease {
+    let root: URL
+    let mount: ArchiveExtractor.Mount
+
+    init(root: URL, mount: ArchiveExtractor.Mount) {
+        self.root = root
+        self.mount = mount
     }
 
-    static func writeScript(in directory: URL) throws -> URL {
-        let scriptURL = directory.appendingPathComponent("install-update.sh")
-        try script.write(to: scriptURL, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o700],
-            ofItemAtPath: scriptURL.path
+    func discard() async {
+        await mount.discard()
+        try? FileManager.default.removeItem(at: root)
+    }
+}
+
+@MainActor
+struct InstallationDriver {
+    var promote: (URL, URL, Bool) async throws -> Void
+    var replace: (URL, URL, URL, Bool) async throws -> Void
+    var restore: (URL, URL, Bool) async throws -> Void
+    var remove: (URL, Bool) async throws -> Void
+    var validate: (URL, CodeSignature.Identity) throws -> Void
+    var launch: (URL) async throws -> Void
+    var terminate: () -> Void
+
+    static let live = Self(
+        promote: { source, destination, protected in
+            if protected {
+                try await FinderOperations.copy(
+                    source,
+                    to: destination.deletingLastPathComponent()
+                )
+            } else {
+                try FileManager.default.copyItem(at: source, to: destination)
+            }
+        },
+        replace: { candidate, installed, backup, protected in
+            if protected {
+                try await FinderOperations.replace(
+                    installed: installed,
+                    with: candidate,
+                    backup: backup
+                )
+            } else {
+                try FileManager.default.moveItem(at: installed, to: backup)
+                do {
+                    try FileManager.default.copyItem(at: candidate, to: installed)
+                } catch {
+                    try? FileManager.default.moveItem(at: backup, to: installed)
+                    throw error
+                }
+            }
+        },
+        restore: { installed, backup, protected in
+            if protected {
+                try await FinderOperations.restore(installed: installed, backup: backup)
+            } else {
+                if FileManager.default.fileExists(atPath: installed.path) {
+                    try FileManager.default.removeItem(at: installed)
+                }
+                try FileManager.default.moveItem(at: backup, to: installed)
+            }
+        },
+        remove: { url, protected in
+            guard FileManager.default.fileExists(atPath: url.path) else { return }
+            if protected {
+                try await FinderOperations.remove(url)
+            } else {
+                try FileManager.default.removeItem(at: url)
+            }
+        },
+        validate: { url, expected in
+            guard let bundle = Bundle(url: url) else {
+                throw AppUpdaterError.invalidDownloadedBundle
+            }
+            try CodeSignature.requireMatch(
+                current: expected,
+                candidate: CodeSignature.validatedIdentity(of: bundle)
+            )
+        },
+        launch: { url in
+            let configuration = NSWorkspace.OpenConfiguration()
+            configuration.createsNewApplicationInstance = true
+            try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<Void, Error>) in
+                NSWorkspace.shared.openApplication(
+                    at: url,
+                    configuration: configuration
+                ) { application, error in
+                    if let error {
+                        continuation.resume(throwing: error)
+                    } else if application == nil {
+                        continuation.resume(throwing: AppUpdaterError.invalidUpdateState)
+                    } else {
+                        continuation.resume()
+                    }
+                }
+            }
+        },
+        terminate: { NSApp.terminate(nil) }
+    )
+}
+
+@MainActor
+final class PreparedInstallation {
+    let assetName: String
+    let installedURL: URL
+    let candidateURL: URL
+    let promotedImageURL: URL
+    let backupURL: URL
+    let expectedIdentity: CodeSignature.Identity
+    let protected: Bool
+    let driver: InstallationDriver
+    let cleanup: () async -> Void
+
+    init(
+        assetName: String,
+        installedURL: URL,
+        candidateURL: URL,
+        promotedImageURL: URL,
+        expectedIdentity: CodeSignature.Identity,
+        protected: Bool,
+        driver: InstallationDriver,
+        cleanup: @escaping () async -> Void
+    ) {
+        self.assetName = assetName
+        self.installedURL = installedURL
+        self.candidateURL = candidateURL
+        self.promotedImageURL = promotedImageURL
+        backupURL = installedURL.deletingLastPathComponent().appendingPathComponent(
+            ".app-updater-backup-\(UUID().uuidString).app"
         )
-        return scriptURL
+        self.expectedIdentity = expectedIdentity
+        self.protected = protected
+        self.driver = driver
+        self.cleanup = cleanup
     }
 
-    static let script = """
-    #!/bin/sh
-    set -eu
+    func publicUpdate() -> PreparedUpdate {
+        PreparedUpdate(
+            assetName: assetName,
+            install: { [self] in try await installAndRelaunch() },
+            discard: { [self] in await discard() }
+        )
+    }
 
-    pid="$1"
-    staged_bundle="$2"
-    installed_bundle="$3"
-    executable="$4"
-    staging_directory="$5"
-    installed_name="$(basename "$installed_bundle")"
-    installed_parent="$(dirname "$installed_bundle")"
-    prepared_bundle="$(dirname "$staged_bundle")/$installed_name"
-    deadline=$(( $(date +%s) + 300 ))
+    func installAndRelaunch() async throws {
+        try driver.validate(installedURL, expectedIdentity)
+        try driver.validate(candidateURL, expectedIdentity)
+        try await driver.replace(candidateURL, installedURL, backupURL, protected)
+        do {
+            try driver.validate(installedURL, expectedIdentity)
+            try await driver.launch(installedURL)
+        } catch {
+            do {
+                try await driver.restore(installedURL, backupURL, protected)
+            } catch {
+                throw AppUpdaterError.rollbackFailed
+            }
+            throw error
+        }
 
-    trap 'rm -rf "$staging_directory"' EXIT
+        await cleanup()
+        try? await driver.remove(backupURL, protected)
+        try? await driver.remove(promotedImageURL, protected)
+        driver.terminate()
+    }
 
-    while kill -0 "$pid" 2>/dev/null; do
-        if [ "$(date +%s)" -ge "$deadline" ]; then
-            exit 1
-        fi
-        sleep 0.2
-    done
+    func discard() async {
+        await cleanup()
+        try? await driver.remove(promotedImageURL, protected)
+    }
+}
 
-    if [ "$staged_bundle" != "$prepared_bundle" ]; then
-        rm -rf "$prepared_bundle"
-        mv "$staged_bundle" "$prepared_bundle"
-        staged_bundle="$prepared_bundle"
-    fi
+enum Installation {
+    @MainActor
+    static func prepare(
+        assetName: String,
+        lease: StagingLease,
+        installedBundle: Bundle,
+        limits: ArchiveExtractor.Limits,
+        driver: InstallationDriver = .live
+    ) async throws -> PreparedUpdate {
+        let installedURL = installedBundle.bundleURL
+        let parent = installedURL.deletingLastPathComponent()
+        let protected = !FileManager.default.isWritableFile(atPath: parent.path)
+            && !FileManager.default.isWritableFile(atPath: installedURL.path)
+        let promotedImage = parent.appendingPathComponent(
+            lease.mount.imageURL.lastPathComponent
+        )
+        let mountRoot = try AppUpdater.stagingDirectory()
 
-    if [ -w "$installed_parent" ] && { [ ! -e "$installed_bundle" ] || [ -w "$installed_bundle" ]; }; then
-        rm -rf "$installed_bundle"
-        mv "$staged_bundle" "$installed_bundle"
-    else
-        /usr/bin/osascript - "$staged_bundle" "$installed_parent" <<'APPLESCRIPT'
-    on run argv
-        set stagedBundle to POSIX file (item 1 of argv) as alias
-        set destinationFolder to POSIX file (item 2 of argv) as alias
-        tell application "Finder" to move stagedBundle to destinationFolder with replacing
-    end run
-    APPLESCRIPT
-    fi
+        do {
+            try await cleanupStaleItems(
+                in: parent,
+                excluding: installedURL,
+                protected: protected,
+                driver: driver
+            )
+            try await driver.promote(lease.mount.imageURL, promotedImage, protected)
+            try validatePromotion(
+                promotedImage,
+                expectedParent: parent,
+                protected: protected
+            )
+            let mount = try await ArchiveExtractor.mount(
+                promotedImage,
+                at: mountRoot.appendingPathComponent("mounted", isDirectory: true),
+                expectedAppName: installedURL.lastPathComponent,
+                limits: limits
+            )
+            guard let candidate = Bundle(url: mount.appURL) else {
+                throw AppUpdaterError.invalidDownloadedBundle
+            }
+            let identity = try CodeSignature.validatedIdentity(of: installedBundle)
+            try CodeSignature.requireMatch(
+                current: identity,
+                candidate: CodeSignature.validatedIdentity(of: candidate)
+            )
+            await lease.discard()
+            return PreparedInstallation(
+                assetName: assetName,
+                installedURL: installedURL,
+                candidateURL: mount.appURL,
+                promotedImageURL: promotedImage,
+                expectedIdentity: identity,
+                protected: protected,
+                driver: driver,
+                cleanup: {
+                    await mount.discard()
+                    try? FileManager.default.removeItem(at: mountRoot)
+                }
+            ).publicUpdate()
+        } catch {
+            await lease.discard()
+            try? FileManager.default.removeItem(at: mountRoot)
+            try? await driver.remove(promotedImage, protected)
+            if error is AppUpdaterError { throw error }
+            throw AppUpdaterError.promotionFailed
+        }
+    }
 
-    if [ -x "$executable" ]; then
-        "$executable" >/dev/null 2>&1 &
-    else
-        /usr/bin/open "$installed_bundle"
-    fi
-    """
+    static func validatePromotion(
+        _ image: URL,
+        expectedParent: URL,
+        protected: Bool
+    ) throws {
+        let image = image.standardizedFileURL
+        guard image.deletingLastPathComponent() == expectedParent.standardizedFileURL,
+              !hasSymlinkComponent(image)
+        else {
+            throw AppUpdaterError.unsafeInstallationState
+        }
+        var info = stat()
+        guard lstat(image.path, &info) == 0,
+              info.st_mode & S_IFMT == S_IFREG
+        else {
+            throw AppUpdaterError.unsafeInstallationState
+        }
+        if protected {
+            guard info.st_uid != geteuid(), access(image.path, W_OK) != 0,
+                  access(expectedParent.path, W_OK) != 0
+            else {
+                throw AppUpdaterError.unsafeInstallationState
+            }
+        }
+    }
+
+    static func hasSymlinkComponent(_ url: URL) -> Bool {
+        var current = URL(fileURLWithPath: "/", isDirectory: true)
+        for component in url.standardizedFileURL.pathComponents.dropFirst() {
+            current.appendPathComponent(component)
+            var info = stat()
+            guard lstat(current.path, &info) == 0 else { return true }
+            if info.st_mode & S_IFMT == S_IFLNK { return true }
+        }
+        return false
+    }
+
+    static func ownsStaleItem(_ url: URL) -> Bool {
+        let name = url.lastPathComponent
+        let value: String
+        let expectedType: mode_t
+        if name.hasPrefix(".app-updater-backup-"), name.hasSuffix(".app") {
+            value = String(name.dropFirst(20).dropLast(4))
+            expectedType = S_IFDIR
+        } else if name.hasPrefix(".app-updater-"), name.hasSuffix(".dmg") {
+            value = String(name.dropFirst(13).dropLast(4))
+            expectedType = S_IFREG
+        } else {
+            return false
+        }
+        var info = stat()
+        return UUID(uuidString: value) != nil
+            && lstat(url.path, &info) == 0
+            && info.st_mode & S_IFMT == expectedType
+    }
+
+    @MainActor
+    static func cleanupStaleItems(
+        in parent: URL,
+        excluding installed: URL,
+        protected: Bool,
+        driver: InstallationDriver
+    ) async throws {
+        let contents = try FileManager.default.contentsOfDirectory(
+            at: parent,
+            includingPropertiesForKeys: nil,
+            options: []
+        )
+        for url in contents where url != installed && ownsStaleItem(url) {
+            try await driver.remove(url, protected)
+        }
+    }
+}
+
+enum FinderOperations {
+    private static let executable = URL(fileURLWithPath: "/usr/bin/osascript")
+
+    static func copy(_ source: URL, to parent: URL) async throws {
+        let script = """
+        on run argv
+          set sourceFile to POSIX file (item 1 of argv) as alias
+          set destinationFolder to POSIX file (item 2 of argv) as alias
+          tell application "Finder" to duplicate sourceFile to destinationFolder
+        end run
+        """
+        _ = try await ProcessRunner.run(
+            executable,
+            arguments: ["-e", script, source.path, parent.path]
+        )
+    }
+
+    static func replace(installed: URL, with candidate: URL, backup: URL) async throws {
+        let script = """
+        on run argv
+          set candidateApp to POSIX file (item 1 of argv) as alias
+          set installedApp to POSIX file (item 2 of argv) as alias
+          set destinationFolder to POSIX file (item 3 of argv) as alias
+          set backupName to item 4 of argv
+          set installedName to item 5 of argv
+          tell application "Finder"
+            set name of installedApp to backupName
+            try
+              duplicate candidateApp to destinationFolder
+            on error message number code
+              set backupApp to POSIX file ((item 3 of argv) & "/" & backupName) as alias
+              set name of backupApp to installedName
+              error message number code
+            end try
+          end tell
+        end run
+        """
+        _ = try await ProcessRunner.run(
+            executable,
+            arguments: [
+                "-e", script, candidate.path, installed.path,
+                installed.deletingLastPathComponent().path,
+                backup.lastPathComponent, installed.lastPathComponent,
+            ]
+        )
+    }
+
+    static func restore(installed: URL, backup: URL) async throws {
+        let script = """
+        on run argv
+          set installedPath to item 1 of argv
+          set backupApp to POSIX file (item 2 of argv) as alias
+          set installedName to item 3 of argv
+          tell application "Finder"
+            if exists POSIX file installedPath then delete POSIX file installedPath
+            set name of backupApp to installedName
+          end tell
+        end run
+        """
+        _ = try await ProcessRunner.run(
+            executable,
+            arguments: ["-e", script, installed.path, backup.path, installed.lastPathComponent]
+        )
+    }
+
+    static func remove(_ url: URL) async throws {
+        let script = """
+        on run argv
+          tell application "Finder" to delete POSIX file (item 1 of argv)
+        end run
+        """
+        _ = try await ProcessRunner.run(
+            executable,
+            arguments: ["-e", script, url.path]
+        )
+    }
 }
 
 enum ProcessRunner {
