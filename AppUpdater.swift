@@ -1067,24 +1067,26 @@ enum ApplicationLauncher {
             throw AppUpdaterError.invalidDownloadedBundle
         }
         try await launchNewInstance(
-            runningProcessIdentifiers: {
-                Set(NSRunningApplication.runningApplications(
-                    withBundleIdentifier: identifier
-                ).compactMap { application in
-                    guard !application.isTerminated,
-                          application.isFinishedLaunching,
-                          application.processIdentifier > 0,
-                          application.executableURL?.resolvingSymlinksInPath() == executableURL
-                    else { return nil }
-                    return application.processIdentifier
-                })
+            spawn: {
+                let process = Process()
+                process.executableURL = executableURL
+                process.standardInput = FileHandle.nullDevice
+                process.standardOutput = FileHandle.nullDevice
+                process.standardError = FileHandle.nullDevice
+                try process.run()
+                return process.processIdentifier
             },
-            forceLaunch: {
-                _ = try await ProcessRunner.run(
-                    URL(fileURLWithPath: "/usr/bin/open"),
-                    arguments: ["-n", url.path],
-                    timeout: 30
-                )
+            isReady: { processIdentifier in
+                guard let application = NSRunningApplication(
+                    processIdentifier: processIdentifier
+                ),
+                    !application.isTerminated,
+                    application.isFinishedLaunching,
+                    application.bundleIdentifier == identifier,
+                    application.executableURL?.resolvingSymlinksInPath() == executableURL
+                else { return false }
+                application.activate()
+                return true
             },
             pause: { try await Task.sleep(nanoseconds: 50_000_000) }
         )
@@ -1092,15 +1094,13 @@ enum ApplicationLauncher {
 
     static func launchNewInstance(
         attempts: Int = 200,
-        currentProcessIdentifier: pid_t = getpid(),
-        runningProcessIdentifiers: () -> Set<pid_t>,
-        forceLaunch: () async throws -> Void,
+        spawn: () throws -> pid_t,
+        isReady: (pid_t) -> Bool,
         pause: () async throws -> Void
     ) async throws {
-        let existing = runningProcessIdentifiers().union([currentProcessIdentifier])
-        try await forceLaunch()
+        let processIdentifier = try spawn()
         for _ in 0..<attempts {
-            if !runningProcessIdentifiers().isSubset(of: existing) { return }
+            if isReady(processIdentifier) { return }
             try await pause()
         }
         throw AppUpdaterError.relaunchFailed

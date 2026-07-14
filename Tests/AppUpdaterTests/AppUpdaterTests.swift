@@ -916,45 +916,34 @@ final class AppUpdaterTests: XCTestCase {
     }
 
     @MainActor
-    func testRelaunchRequiresANewProcess() async throws {
-        var samples: [Set<pid_t>] = [[41], [41], [41, 42]]
+    func testRelaunchWaitsForSpawnedProcess() async throws {
+        var samples = [false, false, true]
         var launches = 0
         try await ApplicationLauncher.launchNewInstance(
-            attempts: 2,
-            runningProcessIdentifiers: { samples.removeFirst() },
-            forceLaunch: { launches += 1 },
+            attempts: 3,
+            spawn: {
+                launches += 1
+                return 42
+            },
+            isReady: { processIdentifier in
+                XCTAssertEqual(processIdentifier, 42)
+                return samples.removeFirst()
+            },
             pause: {}
         )
         XCTAssertEqual(launches, 1)
     }
 
     @MainActor
-    func testRelaunchRejectsOnlyTheExistingProcess() async {
+    func testRelaunchRejectsUnreadySpawnedProcess() async {
         do {
             try await ApplicationLauncher.launchNewInstance(
                 attempts: 2,
-                runningProcessIdentifiers: { [41] },
-                forceLaunch: {},
+                spawn: { 42 },
+                isReady: { _ in false },
                 pause: {}
             )
-            XCTFail("launch should fail without a new process")
-        } catch {
-            XCTAssertEqual(error as? AppUpdaterError, .relaunchFailed)
-        }
-    }
-
-    @MainActor
-    func testRelaunchNeverAcceptsTheCurrentProcess() async {
-        var samples: [Set<pid_t>] = [[], [41], [41]]
-        do {
-            try await ApplicationLauncher.launchNewInstance(
-                attempts: 2,
-                currentProcessIdentifier: 41,
-                runningProcessIdentifiers: { samples.removeFirst() },
-                forceLaunch: {},
-                pause: {}
-            )
-            XCTFail("the current process should not satisfy relaunch")
+            XCTFail("launch should fail until the spawned process is ready")
         } catch {
             XCTAssertEqual(error as? AppUpdaterError, .relaunchFailed)
         }
