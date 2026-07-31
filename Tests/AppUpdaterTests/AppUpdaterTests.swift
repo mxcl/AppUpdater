@@ -921,7 +921,7 @@ final class AppUpdaterTests: XCTestCase {
         var termination = [false, true]
         var events: [String] = []
         var launches = 0
-        var protectedProcessIdentifier: pid_t?
+        var armedFallback = false
         try await ApplicationLauncher.launchNewInstance(
             attempts: 3,
             spawn: {
@@ -939,12 +939,12 @@ final class AppUpdaterTests: XCTestCase {
             },
             armFallback: {
                 events.append("arm fallback")
-                protectedProcessIdentifier = $0
+                armedFallback = true
             },
             pause: {}
         )
         XCTAssertEqual(launches, 1)
-        XCTAssertEqual(protectedProcessIdentifier, 42)
+        XCTAssertTrue(armedFallback)
         XCTAssertEqual(events, [
             "terminate probe", "check probe", "check probe", "arm fallback",
         ])
@@ -977,7 +977,7 @@ final class AppUpdaterTests: XCTestCase {
                 isReady: { _ in true },
                 terminateProbe: {},
                 isProbeTerminated: { false },
-                armFallback: { _ in armedFallback = true },
+                armFallback: { armedFallback = true },
                 pause: {}
             )
             XCTFail("launch should fail while the validation process is running")

@@ -82,7 +82,10 @@ decide not to continue.
 Call `installAndRelaunch()` only after the host has saved its state, stopped
 background work, and ceased loading bundle code or resources. The running
 instance moves itself to a backup, copies the validated candidate into its old
-path, and validates that the installed copy launches. It stops that temporary validation instance before committing the transaction, restores the backup if copying, final validation, launch, or probe termination fails, then relaunches (via the fallback) after the old instance exits.
+path, and validates that the installed copy launches. It stops the temporary
+validation instance before committing the transaction and restores the backup
+if copying, final validation, launch, or probe termination fails. On success,
+the old instance exits and an armed fallback launches the installed app.
 
 > [!IMPORTANT]
 > Quiescing must not cause the old instance to exit. In particular, hosts that

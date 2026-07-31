@@ -1093,7 +1093,7 @@ enum ApplicationLauncher {
                 if probe?.isRunning == true { probe?.terminate() }
             },
             isProbeTerminated: { probe?.isRunning == false },
-            armFallback: { _ in
+            armFallback: {
                 try armFallback(
                     oldProcessIdentifier: getpid(),
                     applicationURL: url
@@ -1137,7 +1137,7 @@ enum ApplicationLauncher {
         isReady: (pid_t) -> Bool,
         terminateProbe: () -> Void,
         isProbeTerminated: () -> Bool,
-        armFallback: (pid_t) throws -> Void = { _ in },
+        armFallback: () throws -> Void = {},
         pause: () async throws -> Void
     ) async throws {
         let processIdentifier = try spawn()
@@ -1146,7 +1146,7 @@ enum ApplicationLauncher {
                 terminateProbe()
                 for _ in 0..<attempts {
                     if isProbeTerminated() {
-                        try armFallback(processIdentifier)
+                        try armFallback()
                         return
                     }
                     try await pause()
