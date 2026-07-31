@@ -244,6 +244,58 @@ final class AppUpdaterTests: XCTestCase {
     }
 
     @MainActor
+    func testCheckRejectsUninstallableAssetMetadata() async throws {
+        let cases: [(URL, Int64, AppUpdater.Configuration, AppUpdaterError)] = [
+            (
+                URL(string: "http://example.com/AppUpdater-2.0.0.dmg")!,
+                42,
+                .init(),
+                .insecureDownloadURL
+            ),
+            (
+                URL(string: "https://example.com/AppUpdater-2.0.0.dmg")!,
+                0,
+                .init(),
+                .invalidGitHubResponse
+            ),
+            (
+                URL(string: "https://example.com/AppUpdater-2.0.0.dmg")!,
+                42,
+                .init(maximumDownloadBytes: 41),
+                .resourceLimitExceeded("download size")
+            ),
+        ]
+
+        for (url, size, configuration, expectedError) in cases {
+            let release = try release(
+                "2.0.0",
+                prerelease: false,
+                assetName: "AppUpdater-2.0.0.dmg",
+                downloadURL: url,
+                size: size
+            )
+            let updater = AppUpdater(
+                owner: "mxcl",
+                repo: "AppUpdater",
+                configuration: configuration,
+                currentVersion: { Version(1, 0, 0) },
+                fetchReleases: { [release] },
+                prepareAsset: { _ in
+                    XCTFail("invalid metadata must not prepare an update")
+                    return preparedUpdate()
+                }
+            )
+
+            do {
+                _ = try await updater.check()
+                XCTFail("check should reject invalid asset metadata")
+            } catch {
+                XCTAssertEqual(error as? AppUpdaterError, expectedError)
+            }
+        }
+    }
+
+    @MainActor
     func testCheckRespectsPrereleaseOptIn() async throws {
         let releases = try [
             release("2.0.0-beta.1", prerelease: true, assetName: "AppUpdater-2.0.0-beta.1.dmg"),
@@ -1180,8 +1232,11 @@ final class AppUpdaterTests: XCTestCase {
         _ version: String,
         prerelease: Bool,
         assetName: String,
-        contentType: String = "application/x-apple-diskimage"
+        contentType: String = "application/x-apple-diskimage",
+        downloadURL: URL? = nil,
+        size: Int64 = 42
     ) throws -> Release {
+        let downloadURL = downloadURL ?? URL(string: "https://example.com/\(assetName)")!
         let json = """
         {
           "tag_name": "\(version)",
@@ -1189,9 +1244,9 @@ final class AppUpdaterTests: XCTestCase {
           "assets": [
             {
               "name": "\(assetName)",
-              "browser_download_url": "https://example.com/\(assetName)",
+              "browser_download_url": "\(downloadURL.absoluteString)",
               "content_type": "\(contentType)",
-              "size": 42
+              "size": \(size)
             }
           ]
         }

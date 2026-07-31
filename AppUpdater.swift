@@ -9,6 +9,7 @@ public final class AppUpdater {
     private var active: Task<Update?, Swift.Error>?
     private let owner: String
     private let repo: String
+    private let configuration: Configuration
     private let session: URLSession
     private let hasExecutable: @Sendable () -> Bool
     private let currentVersion: @Sendable () throws -> Version
@@ -49,6 +50,7 @@ public final class AppUpdater {
         let session = URLSession(configuration: sessionConfiguration)
         self.owner = owner
         self.repo = repo
+        self.configuration = configuration
         self.session = session
         hasExecutable = { Bundle.main.executableURL != nil }
         currentVersion = { try Bundle.main.appVersion }
@@ -73,6 +75,7 @@ public final class AppUpdater {
     init(
         owner: String,
         repo: String,
+        configuration: Configuration = .init(),
         hasExecutable: @escaping @Sendable () -> Bool = { true },
         currentVersion: @escaping @Sendable () throws -> Version,
         fetchReleases: @escaping @Sendable () async throws -> [Release],
@@ -80,6 +83,7 @@ public final class AppUpdater {
     ) {
         self.owner = owner
         self.repo = repo
+        self.configuration = configuration
         self.session = .shared
         self.hasExecutable = hasExecutable
         self.currentVersion = currentVersion
@@ -93,6 +97,7 @@ public final class AppUpdater {
         }
 
         let repo = repo
+        let configuration = configuration
         let allowPrereleases = allowPrereleases
         let hasExecutable = hasExecutable
         let currentVersion = currentVersion
@@ -113,6 +118,7 @@ public final class AppUpdater {
             ) else {
                 return nil
             }
+            try Self.validateAssetMetadata(update.asset, configuration: configuration)
 
             return Update(
                 version: update.version.description,
@@ -154,19 +160,7 @@ public final class AppUpdater {
         session: URLSession,
         configuration: Configuration
     ) async throws -> PreparedUpdate {
-        guard asset.browserDownloadURL.scheme == "https" else {
-            throw AppUpdaterError.insecureDownloadURL
-        }
-
-        guard let contentType = asset.contentType, contentType == .dmg else {
-            throw AppUpdaterError.unsupportedAsset(asset.name)
-        }
-        guard asset.size > 0 else {
-            throw AppUpdaterError.invalidGitHubResponse
-        }
-        guard asset.size <= configuration.maximumDownloadBytes else {
-            throw AppUpdaterError.resourceLimitExceeded("download size")
-        }
+        try validateAssetMetadata(asset, configuration: configuration)
 
         let tmpdir = try Self.stagingDirectory()
         do {
@@ -213,6 +207,25 @@ public final class AppUpdater {
         } catch {
             try? FileManager.default.removeItem(at: tmpdir)
             throw error
+        }
+    }
+
+    private static func validateAssetMetadata(
+        _ asset: Release.Asset,
+        configuration: Configuration
+    ) throws {
+        guard asset.browserDownloadURL.scheme == "https" else {
+            throw AppUpdaterError.insecureDownloadURL
+        }
+
+        guard let contentType = asset.contentType, contentType == .dmg else {
+            throw AppUpdaterError.unsupportedAsset(asset.name)
+        }
+        guard asset.size > 0 else {
+            throw AppUpdaterError.invalidGitHubResponse
+        }
+        guard asset.size <= configuration.maximumDownloadBytes else {
+            throw AppUpdaterError.resourceLimitExceeded("download size")
         }
     }
 
