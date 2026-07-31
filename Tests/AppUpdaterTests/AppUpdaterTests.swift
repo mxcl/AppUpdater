@@ -175,7 +175,8 @@ final class AppUpdaterTests: XCTestCase {
     }
 
     @MainActor
-    func testCheckUpdatesSelectedAsset() async throws {
+    func testCheckReturnsMetadataWithoutStaging() async throws {
+        var staged = false
         let releases = try [
             release("2.0.0", prerelease: false, assetName: "AppUpdater-2.0.0.dmg"),
         ]
@@ -184,12 +185,19 @@ final class AppUpdaterTests: XCTestCase {
             repo: "AppUpdater",
             currentVersion: { Version(1, 0, 0) },
             fetchReleases: { releases },
-            stageAsset: { asset in stagedUpdate(assetName: asset.name) }
+            prepareAsset: { asset in
+                staged = true
+                return preparedUpdate(assetName: asset.name)
+            }
         )
 
         let update = try await updater.check()
 
+        XCTAssertEqual(update?.version, "2.0.0")
         XCTAssertEqual(update?.assetName, "AppUpdater-2.0.0.dmg")
+        XCTAssertFalse(staged)
+        _ = try await update?.prepareInstallation()
+        XCTAssertTrue(staged)
     }
 
     @MainActor
@@ -200,9 +208,9 @@ final class AppUpdaterTests: XCTestCase {
             hasExecutable: { false },
             currentVersion: { Version(1, 0, 0) },
             fetchReleases: { [] },
-            stageAsset: { _ in
+            prepareAsset: { _ in
                 XCTFail("update should not run")
-                return stagedUpdate()
+                return preparedUpdate()
             }
         )
 
@@ -224,9 +232,9 @@ final class AppUpdaterTests: XCTestCase {
             repo: "AppUpdater",
             currentVersion: { Version(1, 0, 0) },
             fetchReleases: { releases },
-            stageAsset: { _ in
+            prepareAsset: { _ in
                 XCTFail("update should not run")
-                return stagedUpdate()
+                return preparedUpdate()
             }
         )
 
@@ -245,7 +253,7 @@ final class AppUpdaterTests: XCTestCase {
             repo: "AppUpdater",
             currentVersion: { Version(1, 0, 0) },
             fetchReleases: { releases },
-            stageAsset: { asset in stagedUpdate(assetName: asset.name) }
+            prepareAsset: { asset in preparedUpdate(assetName: asset.name) }
         )
         updater.allowPrereleases = true
 
@@ -270,7 +278,7 @@ final class AppUpdaterTests: XCTestCase {
                 await gate.wait()
                 return [release]
             },
-            stageAsset: { asset in stagedUpdate(assetName: asset.name) }
+            prepareAsset: { asset in preparedUpdate(assetName: asset.name) }
         )
 
         async let first = updater.check()
@@ -406,7 +414,7 @@ final class AppUpdaterTests: XCTestCase {
             prerelease: false
         )
 
-        XCTAssertEqual(asset?.name, "AppUpdater-1.9.0.dmg")
+        XCTAssertEqual(asset?.asset.name, "AppUpdater-1.9.0.dmg")
     }
 
     func testFindViableUpdateCanSelectPrerelease() throws {
@@ -421,7 +429,7 @@ final class AppUpdaterTests: XCTestCase {
             prerelease: true
         )
 
-        XCTAssertEqual(asset?.name, "AppUpdater-2.0.0-beta.1.dmg")
+        XCTAssertEqual(asset?.asset.name, "AppUpdater-2.0.0-beta.1.dmg")
     }
 
     func testFindViableUpdateCanSelectDiskImage() throws {
@@ -440,8 +448,8 @@ final class AppUpdaterTests: XCTestCase {
             prerelease: false
         )
 
-        XCTAssertEqual(asset?.name, "AppUpdater-2.0.0.dmg")
-        XCTAssertEqual(asset?.contentType, .dmg)
+        XCTAssertEqual(asset?.asset.name, "AppUpdater-2.0.0.dmg")
+        XCTAssertEqual(asset?.asset.contentType, .dmg)
     }
 
     func testFindViableUpdateSkipsReleasesWithoutMatchingAssets() throws {
@@ -456,7 +464,7 @@ final class AppUpdaterTests: XCTestCase {
             prerelease: false
         )
 
-        XCTAssertEqual(asset?.name, "AppUpdater-1.9.0.dmg")
+        XCTAssertEqual(asset?.asset.name, "AppUpdater-1.9.0.dmg")
     }
 
     func testFindViableUpdateReturnsNilWhenAlreadyCurrent() throws {
@@ -881,6 +889,7 @@ final class AppUpdaterTests: XCTestCase {
     func testUpdateAndPreparedUpdateAreOneShot() async throws {
         var installs = 0
         let update = Update(
+            version: "2.0.0",
             assetName: "AppUpdater-2.0.0.dmg",
             prepare: {
                 PreparedUpdate(
@@ -888,8 +897,7 @@ final class AppUpdaterTests: XCTestCase {
                     install: { installs += 1 },
                     discard: {}
                 )
-            },
-            discard: {}
+            }
         )
 
         let prepared = try await update.prepareInstallation()
@@ -1367,12 +1375,10 @@ private extension URLSession {
 }
 
 @MainActor
-private func stagedUpdate(assetName: String = "AppUpdater-2.0.0.dmg") -> Update {
-    Update(
+private func preparedUpdate(assetName: String = "AppUpdater-2.0.0.dmg") -> PreparedUpdate {
+    PreparedUpdate(
         assetName: assetName,
-        prepare: {
-            PreparedUpdate(assetName: assetName, install: {}, discard: {})
-        },
+        install: {},
         discard: {}
     )
 }

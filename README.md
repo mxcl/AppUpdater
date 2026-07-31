@@ -8,13 +8,14 @@ GitHub Releases, validates a DMG, replaces the running app, and relaunches it.
 [coveralls-badge]: https://coveralls.io/repos/github/mxcl/AppUpdater/badge.svg
 [coveralls]: https://coveralls.io/github/mxcl/AppUpdater
 
-AppUpdater supports macOS 12 and later. Version 3 has a source-breaking API.
+AppUpdater supports macOS 12 and later. Version 4 separates update discovery
+from downloading and preparing an installation.
 
 ## Package
 
 ```swift
 package.dependencies.append(
-    .package(url: "https://github.com/mxcl/AppUpdater.git", from: "3.0.0")
+    .package(url: "https://github.com/mxcl/AppUpdater.git", from: "4.0.0")
 )
 ```
 
@@ -51,9 +52,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task { @MainActor in
             do {
                 guard let update = try await updater.check() else { return }
+                print("Version \(update.version) is available")
 
-                // The app can keep operating while this runs. Finder may ask
-                // for authorization when the app lives in a protected folder.
+                // This downloads and validates the update. The app can keep
+                // operating while it runs. Finder may ask for authorization
+                // when the app lives in a protected folder.
                 let prepared = try await update.prepareInstallation()
 
                 // Save documents, stop background work, close helper processes,
@@ -70,14 +73,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 ```
 
-`check()` downloads the DMG, mounts it read-only and non-browsable, enforces the
-configured resource limits, and validates the app. It returns a one-shot
-`Update` without exposing staging paths.
+`check()` fetches bounded GitHub release metadata and returns a lightweight,
+one-shot `Update` with `version` and `assetName`. It does not download the DMG.
 
-`prepareInstallation()` copies the DMG beside the installed app, mounts that
-copy read-only, and repeats the resource and signature checks. The returned
-`PreparedUpdate` is also one-shot. Call `discard()` on either object if you
-decide not to continue.
+`prepareInstallation()` downloads the DMG, mounts it read-only and
+non-browsable, enforces the configured resource limits, and validates the app.
+It then copies the DMG beside the installed app, mounts that copy read-only,
+and repeats the resource and signature checks. The returned `PreparedUpdate`
+is also one-shot. Call `discard()` on either object if you decide not to
+continue.
 
 Call `installAndRelaunch()` only after the host has saved its state, stopped
 background work, and ceased loading bundle code or resources. The running
@@ -119,6 +123,10 @@ let updater = AppUpdater(
 AppUpdater aims to prevent privilege amplification. A same-user attacker must
 not be able to replace a downloaded candidate and then borrow Finder's
 authorization to modify an app that the user cannot otherwise replace.
+
+The result of `check()` is advisory GitHub metadata, not an authenticated app.
+Only `prepareInstallation()` downloads and authenticates the candidate. Do not
+grant privileges or stop security services based only on an available update.
 
 For every candidate, AppUpdater requires a valid Developer ID Application
 signature. The installed and candidate apps must have the same Team ID, signing
