@@ -9,11 +9,12 @@ public final class AppUpdater {
     private var active: Task<Update?, Swift.Error>?
     private let owner: String
     private let repo: String
+    private let configuration: Configuration
     private let session: URLSession
     private let hasExecutable: @Sendable () -> Bool
     private let currentVersion: @Sendable () throws -> Version
     private let fetchReleases: @Sendable () async throws -> [Release]
-    private let stageAsset: @MainActor @Sendable (Release.Asset) async throws -> Update
+    private let prepareAsset: @MainActor @Sendable (Release.Asset) async throws -> PreparedUpdate
 
     public var allowPrereleases = false
 
@@ -49,6 +50,7 @@ public final class AppUpdater {
         let session = URLSession(configuration: sessionConfiguration)
         self.owner = owner
         self.repo = repo
+        self.configuration = configuration
         self.session = session
         hasExecutable = { Bundle.main.executableURL != nil }
         currentVersion = { try Bundle.main.appVersion }
@@ -60,8 +62,8 @@ public final class AppUpdater {
                 configuration: configuration
             )
         }
-        stageAsset = { asset in
-            try await Self.stageUpdate(
+        prepareAsset = { asset in
+            try await Self.prepareUpdate(
                 with: asset,
                 replacing: .main,
                 session: session,
@@ -73,18 +75,20 @@ public final class AppUpdater {
     init(
         owner: String,
         repo: String,
+        configuration: Configuration = .init(),
         hasExecutable: @escaping @Sendable () -> Bool = { true },
         currentVersion: @escaping @Sendable () throws -> Version,
         fetchReleases: @escaping @Sendable () async throws -> [Release],
-        stageAsset: @escaping @MainActor @Sendable (Release.Asset) async throws -> Update
+        prepareAsset: @escaping @MainActor @Sendable (Release.Asset) async throws -> PreparedUpdate
     ) {
         self.owner = owner
         self.repo = repo
+        self.configuration = configuration
         self.session = .shared
         self.hasExecutable = hasExecutable
         self.currentVersion = currentVersion
         self.fetchReleases = fetchReleases
-        self.stageAsset = stageAsset
+        self.prepareAsset = prepareAsset
     }
 
     public func check() async throws -> Update? {
@@ -93,11 +97,12 @@ public final class AppUpdater {
         }
 
         let repo = repo
+        let configuration = configuration
         let allowPrereleases = allowPrereleases
         let hasExecutable = hasExecutable
         let currentVersion = currentVersion
         let fetchReleases = fetchReleases
-        let stageAsset = stageAsset
+        let prepareAsset = prepareAsset
 
         let task = Task<Update?, Swift.Error> {
             guard hasExecutable() else {
@@ -106,15 +111,20 @@ public final class AppUpdater {
 
             let appVersion = try currentVersion()
             let releases = try await fetchReleases()
-            guard let asset = try releases.findViableUpdate(
+            guard let update = try releases.findViableUpdate(
                 appVersion: appVersion,
                 repo: repo,
                 prerelease: allowPrereleases
             ) else {
                 return nil
             }
+            try Self.validateAssetMetadata(update.asset, configuration: configuration)
 
-            return try await stageAsset(asset)
+            return Update(
+                version: update.version.description,
+                assetName: update.asset.name,
+                prepare: { try await prepareAsset(update.asset) }
+            )
         }
 
         active = task
@@ -144,25 +154,13 @@ public final class AppUpdater {
         return try decoder.decode([Release].self, from: data)
     }
 
-    private static func stageUpdate(
+    private static func prepareUpdate(
         with asset: Release.Asset,
         replacing installedAppBundle: Bundle,
         session: URLSession,
         configuration: Configuration
-    ) async throws -> Update {
-        guard asset.browserDownloadURL.scheme == "https" else {
-            throw AppUpdaterError.insecureDownloadURL
-        }
-
-        guard let contentType = asset.contentType, contentType == .dmg else {
-            throw AppUpdaterError.unsupportedAsset(asset.name)
-        }
-        guard asset.size > 0 else {
-            throw AppUpdaterError.invalidGitHubResponse
-        }
-        guard asset.size <= configuration.maximumDownloadBytes else {
-            throw AppUpdaterError.resourceLimitExceeded("download size")
-        }
+    ) async throws -> PreparedUpdate {
+        try validateAssetMetadata(asset, configuration: configuration)
 
         let tmpdir = try Self.stagingDirectory()
         do {
@@ -200,21 +198,34 @@ public final class AppUpdater {
             }
 
             let lease = StagingLease(root: tmpdir, mount: mount)
-            return Update(
+            return try await Installation.prepare(
                 assetName: asset.name,
-                prepare: {
-                    try await Installation.prepare(
-                        assetName: asset.name,
-                        lease: lease,
-                        installedBundle: installedAppBundle,
-                        limits: limits
-                    )
-                },
-                discard: { await lease.discard() }
+                lease: lease,
+                installedBundle: installedAppBundle,
+                limits: limits
             )
         } catch {
             try? FileManager.default.removeItem(at: tmpdir)
             throw error
+        }
+    }
+
+    private static func validateAssetMetadata(
+        _ asset: Release.Asset,
+        configuration: Configuration
+    ) throws {
+        guard asset.browserDownloadURL.scheme == "https" else {
+            throw AppUpdaterError.insecureDownloadURL
+        }
+
+        guard let contentType = asset.contentType, contentType == .dmg else {
+            throw AppUpdaterError.unsupportedAsset(asset.name)
+        }
+        guard asset.size > 0 else {
+            throw AppUpdaterError.invalidGitHubResponse
+        }
+        guard asset.size <= configuration.maximumDownloadBytes else {
+            throw AppUpdaterError.resourceLimitExceeded("download size")
         }
     }
 
@@ -236,36 +247,31 @@ public final class AppUpdater {
 @MainActor
 public final class Update {
     typealias PrepareOperation = @MainActor () async throws -> PreparedUpdate
-    typealias DiscardOperation = @MainActor () async -> Void
 
+    public let version: String
     public let assetName: String
     private var prepareOperation: PrepareOperation?
-    private var discardOperation: DiscardOperation?
 
     public func prepareInstallation() async throws -> PreparedUpdate {
         guard let operation = prepareOperation else {
             throw AppUpdaterError.invalidUpdateState
         }
         prepareOperation = nil
-        discardOperation = nil
         return try await operation()
     }
 
     public func discard() async {
-        let operation = discardOperation
         prepareOperation = nil
-        discardOperation = nil
-        await operation?()
     }
 
     init(
+        version: String,
         assetName: String,
-        prepare: @escaping PrepareOperation,
-        discard: @escaping DiscardOperation
+        prepare: @escaping PrepareOperation
     ) {
+        self.version = version
         self.assetName = assetName
         prepareOperation = prepare
-        discardOperation = discard
     }
 }
 
@@ -587,19 +593,24 @@ enum ContentType: Decodable, Equatable {
     }
 }
 
+struct AvailableUpdate {
+    let version: Version
+    let asset: Release.Asset
+}
+
 extension Array where Element == Release {
     func findViableUpdate(
         appVersion: Version,
         repo: String,
         prerelease: Bool
-    ) throws -> Release.Asset? {
+    ) throws -> AvailableUpdate? {
         let suitableReleases = prerelease ? self : filter { !$0.prerelease }
         for release in suitableReleases.sorted().reversed() {
             guard appVersion < release.tagName else {
                 return nil
             }
             if let asset = release.viableAsset(forRepo: repo) {
-                return asset
+                return AvailableUpdate(version: release.tagName, asset: asset)
             }
         }
         return nil
