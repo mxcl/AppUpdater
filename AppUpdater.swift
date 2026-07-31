@@ -361,7 +361,7 @@ public enum AppUpdaterError: LocalizedError, Equatable {
         case .processFailed(let executable, let status, let stderr):
             "\(executable.path) failed with status \(status): \(stderr)"
         case .relaunchFailed:
-            "The updated app did not launch a new application instance."
+            "The updated app could not be relaunched safely."
         case .resourceLimitExceeded(let resource):
             "The update exceeded the configured \(resource) limit."
         case .rollbackFailed:
@@ -1066,6 +1066,7 @@ enum ApplicationLauncher {
         else {
             throw AppUpdaterError.invalidDownloadedBundle
         }
+        var probe: Process?
         try await launchNewInstance(
             spawn: {
                 let process = Process()
@@ -1074,6 +1075,7 @@ enum ApplicationLauncher {
                 process.standardOutput = FileHandle.nullDevice
                 process.standardError = FileHandle.nullDevice
                 try process.run()
+                probe = process
                 return process.processIdentifier
             },
             isReady: { processIdentifier in
@@ -1085,10 +1087,13 @@ enum ApplicationLauncher {
                     application.bundleIdentifier == identifier,
                     application.executableURL?.resolvingSymlinksInPath() == executableURL
                 else { return false }
-                application.activate()
                 return true
             },
-            armFallback: { _ in
+            terminateProbe: {
+                if probe?.isRunning == true { probe?.terminate() }
+            },
+            isProbeTerminated: { probe?.isRunning == false },
+            armFallback: {
                 try armFallback(
                     oldProcessIdentifier: getpid(),
                     applicationURL: url
@@ -1130,14 +1135,23 @@ enum ApplicationLauncher {
         attempts: Int = 200,
         spawn: () throws -> pid_t,
         isReady: (pid_t) -> Bool,
-        armFallback: (pid_t) throws -> Void = { _ in },
+        terminateProbe: () -> Void,
+        isProbeTerminated: () -> Bool,
+        armFallback: () throws -> Void = {},
         pause: () async throws -> Void
     ) async throws {
         let processIdentifier = try spawn()
         for _ in 0..<attempts {
             if isReady(processIdentifier) {
-                try armFallback(processIdentifier)
-                return
+                terminateProbe()
+                for _ in 0..<attempts {
+                    if isProbeTerminated() {
+                        try armFallback()
+                        return
+                    }
+                    try await pause()
+                }
+                throw AppUpdaterError.relaunchFailed
             }
             try await pause()
         }

@@ -916,10 +916,12 @@ final class AppUpdaterTests: XCTestCase {
     }
 
     @MainActor
-    func testRelaunchWaitsForSpawnedProcess() async throws {
-        var samples = [false, false, true]
+    func testRelaunchTerminatesProbeBeforeArmingFallback() async throws {
+        var readiness = [false, false, true]
+        var termination = [false, true]
+        var events: [String] = []
         var launches = 0
-        var protectedProcessIdentifier: pid_t?
+        var armedFallback = false
         try await ApplicationLauncher.launchNewInstance(
             attempts: 3,
             spawn: {
@@ -928,13 +930,24 @@ final class AppUpdaterTests: XCTestCase {
             },
             isReady: { processIdentifier in
                 XCTAssertEqual(processIdentifier, 42)
-                return samples.removeFirst()
+                return readiness.removeFirst()
             },
-            armFallback: { protectedProcessIdentifier = $0 },
+            terminateProbe: { events.append("terminate probe") },
+            isProbeTerminated: {
+                events.append("check probe")
+                return termination.removeFirst()
+            },
+            armFallback: {
+                events.append("arm fallback")
+                armedFallback = true
+            },
             pause: {}
         )
         XCTAssertEqual(launches, 1)
-        XCTAssertEqual(protectedProcessIdentifier, 42)
+        XCTAssertTrue(armedFallback)
+        XCTAssertEqual(events, [
+            "terminate probe", "check probe", "check probe", "arm fallback",
+        ])
     }
 
     @MainActor
@@ -944,11 +957,33 @@ final class AppUpdaterTests: XCTestCase {
                 attempts: 2,
                 spawn: { 42 },
                 isReady: { _ in false },
+                terminateProbe: {},
+                isProbeTerminated: { false },
                 pause: {}
             )
             XCTFail("launch should fail until the spawned process is ready")
         } catch {
             XCTAssertEqual(error as? AppUpdaterError, .relaunchFailed)
+        }
+    }
+
+    @MainActor
+    func testRelaunchRejectsUnstoppableProbe() async {
+        var armedFallback = false
+        do {
+            try await ApplicationLauncher.launchNewInstance(
+                attempts: 1,
+                spawn: { 42 },
+                isReady: { _ in true },
+                terminateProbe: {},
+                isProbeTerminated: { false },
+                armFallback: { armedFallback = true },
+                pause: {}
+            )
+            XCTFail("launch should fail while the validation process is running")
+        } catch {
+            XCTAssertEqual(error as? AppUpdaterError, .relaunchFailed)
+            XCTAssertFalse(armedFallback)
         }
     }
 
