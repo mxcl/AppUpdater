@@ -8,6 +8,29 @@ final class AppUpdaterTests: XCTestCase {
         let updater = AppUpdater(owner: "mxcl", repo: "AppUpdater")
 
         XCTAssertFalse(updater.allowPrereleases)
+        XCTAssertNil(AppUpdater.Configuration().attestationPolicy)
+    }
+
+    func testReleaseDecodesAttestationMetadata() throws {
+        let expected = String(repeating: "a", count: 64)
+        let json = """
+        {
+          "tag_name": "4.1.0",
+          "target_commitish": "3678ec46fe9e5fde87bcafcbc131e499feef5d5a",
+          "prerelease": false,
+          "assets": [{
+            "name": "AppUpdater-4.1.0.dmg",
+            "browser_download_url": "https://example.com/update.dmg",
+            "content_type": "application/x-apple-diskimage",
+            "size": 42,
+            "digest": "sha256:\(expected)"
+          }]
+        }
+        """.data(using: .utf8)!
+
+        let release = try JSONDecoder().decode(Release.self, from: json)
+        XCTAssertEqual(release.targetCommitish, "3678ec46fe9e5fde87bcafcbc131e499feef5d5a")
+        XCTAssertEqual(try release.assets[0].requiredSHA256Digest().hex, expected)
     }
 
     func testFetchReleasesUsesGitHubAPIAndTolerantVersionDecoding() async throws {
@@ -1157,6 +1180,32 @@ final class AppUpdaterTests: XCTestCase {
         try Data("attacker".utf8).write(to: source)
 
         XCTAssertEqual(try Data(contentsOf: destination), Data("validated".utf8))
+    }
+
+    func testPromotedDigestRejectsSubstitution() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let image = root.appendingPathComponent("promoted.dmg")
+        let original = Data("validated".utf8)
+        try original.write(to: image)
+        XCTAssertNoThrow(
+            try Installation.validatePromotedDigest(
+                image,
+                expected: original.sha256,
+                maximumBytes: 100
+            )
+        )
+
+        try Data("substituted".utf8).write(to: image)
+        XCTAssertThrowsError(
+            try Installation.validatePromotedDigest(
+                image,
+                expected: original.sha256,
+                maximumBytes: 100
+            )
+        ) { error in
+            XCTAssertEqual(error as? AppUpdaterError, .attestationVerificationFailed)
+        }
     }
 
     func testProtectedPromotionRejectsUserOwnedFileEvenWhenReadOnly() throws {

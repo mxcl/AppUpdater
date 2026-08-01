@@ -14,7 +14,7 @@ public final class AppUpdater {
     private let hasExecutable: @Sendable () -> Bool
     private let currentVersion: @Sendable () throws -> Version
     private let fetchReleases: @Sendable () async throws -> [Release]
-    private let prepareAsset: @MainActor @Sendable (Release.Asset) async throws -> PreparedUpdate
+    private let prepareAsset: @MainActor @Sendable (Release.Asset, String) async throws -> PreparedUpdate
 
     public var allowPrereleases = false
 
@@ -23,12 +23,14 @@ public final class AppUpdater {
         public var maximumMountedBytes: Int64
         public var maximumEntries: Int
         public var timeout: TimeInterval
+        public var attestationPolicy: GitHubAttestationPolicy?
 
         public init(
             maximumDownloadBytes: Int64 = 2 * 1024 * 1024 * 1024,
             maximumMountedBytes: Int64 = 4 * 1024 * 1024 * 1024,
             maximumEntries: Int = 100_000,
-            timeout: TimeInterval = 10 * 60
+            timeout: TimeInterval = 10 * 60,
+            attestationPolicy: GitHubAttestationPolicy? = nil
         ) {
             precondition(maximumDownloadBytes > 0)
             precondition(maximumMountedBytes > 0)
@@ -38,6 +40,7 @@ public final class AppUpdater {
             self.maximumMountedBytes = maximumMountedBytes
             self.maximumEntries = maximumEntries
             self.timeout = timeout
+            self.attestationPolicy = attestationPolicy
         }
     }
 
@@ -62,9 +65,12 @@ public final class AppUpdater {
                 configuration: configuration
             )
         }
-        prepareAsset = { asset in
+        prepareAsset = { asset, commit in
             try await Self.prepareUpdate(
                 with: asset,
+                targetCommit: commit,
+                owner: owner,
+                repo: repo,
                 replacing: .main,
                 session: session,
                 configuration: configuration
@@ -88,7 +94,7 @@ public final class AppUpdater {
         self.hasExecutable = hasExecutable
         self.currentVersion = currentVersion
         self.fetchReleases = fetchReleases
-        self.prepareAsset = prepareAsset
+        self.prepareAsset = { asset, _ in try await prepareAsset(asset) }
     }
 
     public func check() async throws -> Update? {
@@ -123,7 +129,7 @@ public final class AppUpdater {
             return Update(
                 version: update.version.description,
                 assetName: update.asset.name,
-                prepare: { try await prepareAsset(update.asset) }
+                prepare: { try await prepareAsset(update.asset, update.targetCommit) }
             )
         }
 
@@ -156,11 +162,31 @@ public final class AppUpdater {
 
     private static func prepareUpdate(
         with asset: Release.Asset,
+        targetCommit: String,
+        owner: String,
+        repo: String,
         replacing installedAppBundle: Bundle,
         session: URLSession,
         configuration: Configuration
     ) async throws -> PreparedUpdate {
         try validateAssetMetadata(asset, configuration: configuration)
+        let attestation: (GitHubAttestationPolicy, Data, String)?
+        if let policy = configuration.attestationPolicy {
+            do {
+                guard targetCommit.isFullGitCommit else {
+                    throw AttestationFailure.invalid("release target is not a full commit")
+                }
+                attestation = (
+                    policy,
+                    try asset.requiredSHA256Digest(),
+                    targetCommit.lowercased()
+                )
+            } catch {
+                throw AppUpdaterError.attestationVerificationFailed
+            }
+        } else {
+            attestation = nil
+        }
 
         let tmpdir = try Self.stagingDirectory()
         do {
@@ -174,6 +200,39 @@ public final class AppUpdater {
                 maximumBytes: asset.size,
                 timeout: configuration.timeout
             )
+
+            let verifiedDigest: Data?
+            if let (policy, digest, sourceCommit) = attestation {
+                do {
+                    let downloadedDigest = try FileHasher.sha256(
+                        downloadURL,
+                        maximumBytes: configuration.maximumDownloadBytes
+                    )
+                    guard downloadedDigest == digest else {
+                        throw AttestationFailure.invalid("release digest mismatch")
+                    }
+                    try await GitHubAttestationVerifier(
+                        owner: owner,
+                        repository: repo,
+                        policy: policy,
+                        session: session,
+                        timeout: configuration.timeout
+                    ).verify(
+                        assetName: asset.name,
+                        digest: digest,
+                        sourceCommit: sourceCommit
+                    )
+                    verifiedDigest = digest
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch let error as URLError where error.code == .cancelled {
+                    throw CancellationError()
+                } catch {
+                    throw AppUpdaterError.attestationVerificationFailed
+                }
+            } else {
+                verifiedDigest = nil
+            }
 
             let limits = ArchiveExtractor.Limits(configuration)
             let mount = try await ArchiveExtractor.mount(
@@ -202,7 +261,9 @@ public final class AppUpdater {
                 assetName: asset.name,
                 lease: lease,
                 installedBundle: installedAppBundle,
-                limits: limits
+                limits: limits,
+                verifiedDigest: verifiedDigest,
+                maximumImageBytes: configuration.maximumDownloadBytes
             )
         } catch {
             try? FileManager.default.removeItem(at: tmpdir)
@@ -313,6 +374,7 @@ public final class PreparedUpdate {
 
 public enum AppUpdaterError: LocalizedError, Equatable {
     case bundleExecutableURL
+    case attestationVerificationFailed
     case invalidAppVersion(String)
     case invalidArchiveEntry(String)
     case invalidDownloadedBundle
@@ -336,6 +398,8 @@ public enum AppUpdaterError: LocalizedError, Equatable {
 
     public var errorDescription: String? {
         switch self {
+        case .attestationVerificationFailed:
+            "The update’s GitHub Actions provenance could not be verified."
         case .bundleExecutableURL:
             "The running bundle has no executable URL."
         case .invalidAppVersion(let version):
@@ -386,19 +450,35 @@ enum NetworkTransfer {
     static func data(
         for request: URLRequest,
         with session: URLSession,
-        maximumBytes: Int64
+        maximumBytes: Int64,
+        allowedContentTypes: Set<String>? = nil,
+        permitsCompression: Bool = true
     ) async throws -> Data {
         let delegate = TransferDelegate(maximumBytes: maximumBytes)
         do {
-            let (data, response) = try await session.data(
+            let (bytes, response) = try await session.bytes(
                 for: request,
                 delegate: delegate
             )
-            if let error = delegate.error { throw error }
-            try validate(response)
-            guard data.count <= maximumBytes else {
+            try validate(
+                response,
+                allowedContentTypes: allowedContentTypes,
+                permitsCompression: permitsCompression
+            )
+            if response.expectedContentLength > maximumBytes {
                 throw AppUpdaterError.resourceLimitExceeded("response size")
             }
+            var data = Data()
+            if response.expectedContentLength > 0 {
+                data.reserveCapacity(Int(min(response.expectedContentLength, maximumBytes)))
+            }
+            for try await byte in bytes {
+                guard data.count < maximumBytes else {
+                    throw AppUpdaterError.resourceLimitExceeded("response size")
+                }
+                data.append(byte)
+            }
+            if let error = delegate.error { throw error }
             return data
         } catch {
             throw delegate.error ?? mapped(error)
@@ -444,11 +524,28 @@ enum NetworkTransfer {
         return error
     }
 
-    private static func validate(_ response: URLResponse) throws {
+    private static func validate(
+        _ response: URLResponse,
+        allowedContentTypes: Set<String>? = nil,
+        permitsCompression: Bool = true
+    ) throws {
         guard response.url?.scheme?.lowercased() == "https",
               let response = response as? HTTPURLResponse,
               200..<300 ~= response.statusCode
         else {
+            throw AppUpdaterError.invalidHTTPResponse
+        }
+        if let allowedContentTypes {
+            guard let contentType = response.value(forHTTPHeaderField: "Content-Type")?
+                .split(separator: ";", maxSplits: 1).first?
+                .trimmingCharacters(in: .whitespaces).lowercased(),
+                allowedContentTypes.contains(contentType)
+            else { throw AppUpdaterError.invalidHTTPResponse }
+        }
+        if !permitsCompression,
+           let encoding = response.value(forHTTPHeaderField: "Content-Encoding"),
+           encoding.lowercased() != "identity"
+        {
             throw AppUpdaterError.invalidHTTPResponse
         }
     }
@@ -461,6 +558,7 @@ enum NetworkTransfer {
         private let maximumBytes: Int64
         private let lock = NSLock()
         private var storedError: AppUpdaterError?
+        private var redirectCount = 0
 
         init(maximumBytes: Int64) {
             self.maximumBytes = maximumBytes
@@ -477,9 +575,13 @@ enum NetworkTransfer {
             newRequest request: URLRequest,
             completionHandler: @escaping @Sendable (URLRequest?) -> Void
         ) {
-            guard request.url?.scheme?.lowercased() == "https" else {
+            let allowed = lock.withLock { () -> Bool in
+                redirectCount += 1
+                return redirectCount <= 5
+            }
+            guard allowed, request.url?.scheme?.lowercased() == "https" else {
                 lock.withLock {
-                    storedError = .insecureDownloadURL
+                    storedError = allowed ? .insecureDownloadURL : .invalidHTTPResponse
                 }
                 completionHandler(nil)
                 return
@@ -511,13 +613,23 @@ enum NetworkTransfer {
 
 struct Release: Decodable, Comparable {
     let tagName: Version
+    let targetCommitish: String
     let prerelease: Bool
     let assets: [Asset]
 
     enum CodingKeys: String, CodingKey {
         case tagName = "tag_name"
+        case targetCommitish = "target_commitish"
         case prerelease
         case assets
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        tagName = try values.decode(Version.self, forKey: .tagName)
+        targetCommitish = try values.decodeIfPresent(String.self, forKey: .targetCommitish) ?? ""
+        prerelease = try values.decode(Bool.self, forKey: .prerelease)
+        assets = try values.decode([Asset].self, forKey: .assets)
     }
 
     struct Asset: Decodable, Equatable {
@@ -525,12 +637,14 @@ struct Release: Decodable, Comparable {
         let browserDownloadURL: URL
         let contentType: ContentType?
         let size: Int64
+        let digest: String?
 
         enum CodingKeys: String, CodingKey {
             case name
             case browserDownloadURL = "browser_download_url"
             case contentType = "content_type"
             case size
+            case digest
         }
 
         init(from decoder: Decoder) throws {
@@ -549,6 +663,15 @@ struct Release: Decodable, Comparable {
                 assetName: name
             )
             size = try container.decodeIfPresent(Int64.self, forKey: .size) ?? 0
+            digest = try container.decodeIfPresent(String.self, forKey: .digest)
+        }
+
+        func requiredSHA256Digest() throws -> Data {
+            guard let digest, digest.hasPrefix("sha256:"),
+                  digest.count == 71,
+                  let value = Data(hex: String(digest.dropFirst(7))), value.count == 32
+            else { throw AttestationFailure.invalid("missing SHA-256 asset digest") }
+            return value
         }
     }
 
@@ -596,6 +719,7 @@ enum ContentType: Decodable, Equatable {
 struct AvailableUpdate {
     let version: Version
     let asset: Release.Asset
+    let targetCommit: String
 }
 
 extension Array where Element == Release {
@@ -610,7 +734,11 @@ extension Array where Element == Release {
                 return nil
             }
             if let asset = release.viableAsset(forRepo: repo) {
-                return AvailableUpdate(version: release.tagName, asset: asset)
+                return AvailableUpdate(
+                    version: release.tagName,
+                    asset: asset,
+                    targetCommit: release.targetCommitish
+                )
             }
         }
         return nil
@@ -1255,6 +1383,8 @@ enum Installation {
         lease: StagingLease,
         installedBundle: Bundle,
         limits: ArchiveExtractor.Limits,
+        verifiedDigest: Data? = nil,
+        maximumImageBytes: Int64 = 2 * 1024 * 1024 * 1024,
         driver: InstallationDriver = .live
     ) async throws -> PreparedUpdate {
         let installedURL = installedBundle.bundleURL
@@ -1280,6 +1410,13 @@ enum Installation {
                 expectedParent: parent,
                 protected: protected
             )
+            if let verifiedDigest {
+                try validatePromotedDigest(
+                    promotedImage,
+                    expected: verifiedDigest,
+                    maximumBytes: maximumImageBytes
+                )
+            }
             let mount = try await ArchiveExtractor.mount(
                 promotedImage,
                 at: mountRoot.appendingPathComponent("mounted", isDirectory: true),
@@ -1342,6 +1479,16 @@ enum Installation {
             else {
                 throw AppUpdaterError.unsafeInstallationState
             }
+        }
+    }
+
+    static func validatePromotedDigest(
+        _ image: URL,
+        expected: Data,
+        maximumBytes: Int64
+    ) throws {
+        guard try FileHasher.sha256(image, maximumBytes: maximumBytes) == expected else {
+            throw AppUpdaterError.attestationVerificationFailed
         }
     }
 
