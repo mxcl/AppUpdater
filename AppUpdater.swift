@@ -473,7 +473,7 @@ enum NetworkTransfer {
                 data.reserveCapacity(Int(min(response.expectedContentLength, maximumBytes)))
             }
             for try await byte in bytes {
-                guard data.count < maximumBytes else {
+                guard Int64(data.count) < maximumBytes else {
                     throw AppUpdaterError.resourceLimitExceeded("response size")
                 }
                 data.append(byte)

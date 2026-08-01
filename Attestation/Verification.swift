@@ -143,7 +143,11 @@ struct BundleVerifier {
         guard proofIndex < treeSize else {
             throw AttestationFailure.invalid("invalid Rekor proof index")
         }
-        let logKey = try trustedRoot.logKey(id: entry.logId.keyId, at: integratedDate)
+        let log = try trustedRoot.transparencyLog(id: entry.logId.keyId, at: integratedDate)
+        let logKey = log.publicKey
+        guard let logHost = URL(string: log.baseUrl)?.host?.lowercased() else {
+            throw AttestationFailure.invalid("invalid transparency log URL")
+        }
 
         let object = try JSONSerialization.jsonObject(with: entry.canonicalizedBody)
         guard try JSONCanonicalizer.canonicalize(object) == entry.canonicalizedBody else {
@@ -175,7 +179,7 @@ struct BundleVerifier {
                 "logID": entry.logId.keyId.hex,
                 "logIndex": logIndex,
             ]
-            try verifyLogSignature(
+            try Self.verifyLogSignature(
                 entry.inclusionPromise.signedEntryTimestamp,
                 message: try JSONCanonicalizer.canonicalize(setPayload),
                 key: logKey
@@ -190,30 +194,43 @@ struct BundleVerifier {
             hashes: entry.inclusionProof.hashes,
             expectedRoot: entry.inclusionProof.rootHash
         )
-        try verifyCheckpoint(
+        try Self.verifyCheckpoint(
             entry.inclusionProof.checkpoint.envelope,
             treeSize: treeSize,
             rootHash: entry.inclusionProof.rootHash,
             logID: entry.logId.keyId,
+            expectedHost: logHost,
             key: logKey
         )
     }
 
-    private func verifyCheckpoint(
+    static func verifyCheckpoint(
         _ checkpoint: String,
         treeSize: UInt64,
         rootHash: Data,
         logID: Data,
+        expectedHost: String,
         key: SigstoreTrustedRoot.PublicKey
     ) throws {
         let parts = checkpoint.split(separator: "\n", omittingEmptySubsequences: false)
-        guard parts.count == 6, parts[0].hasPrefix("rekor.sigstore.dev - "),
+        let header = parts.first?.split(
+            separator: " ",
+            maxSplits: 2,
+            omittingEmptySubsequences: true
+        ) ?? []
+        guard parts.count == 6, header.count == 3, header[1] == "-", !header[2].isEmpty,
+              header[0].lowercased() == expectedHost,
+              expectedHost == "rekor.sigstore.dev"
+                || expectedHost.hasSuffix(".rekor.sigstore.dev"),
               parts[1] == String(treeSize),
               Data(base64Encoded: String(parts[2])) == rootHash,
-              parts[3].isEmpty, parts[5].isEmpty,
-              parts[4].hasPrefix("— rekor.sigstore.dev ")
+              parts[3].isEmpty, parts[5].isEmpty
         else { throw AttestationFailure.invalid("invalid Rekor checkpoint") }
-        let encodedSignature = parts[4].dropFirst("— rekor.sigstore.dev ".count)
+        let signaturePrefix = "— \(header[0]) "
+        guard parts[4].hasPrefix(signaturePrefix) else {
+            throw AttestationFailure.invalid("invalid Rekor checkpoint")
+        }
+        let encodedSignature = parts[4].dropFirst(signaturePrefix.count)
         guard let signatureWithHint = Data(base64Encoded: String(encodedSignature)),
               signatureWithHint.count > 4,
               signatureWithHint.prefix(4) == logID.prefix(4)
@@ -222,7 +239,7 @@ struct BundleVerifier {
         try verifyLogSignature(Data(signatureWithHint.dropFirst(4)), message: message, key: key)
     }
 
-    private func verifyLogSignature(
+    private static func verifyLogSignature(
         _ signature: Data,
         message: Data,
         key: SigstoreTrustedRoot.PublicKey

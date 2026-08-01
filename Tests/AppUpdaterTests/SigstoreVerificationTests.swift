@@ -1,4 +1,5 @@
 @testable import AppUpdater
+import CryptoKit
 import XCTest
 
 final class SigstoreVerificationTests: XCTestCase {
@@ -10,6 +11,43 @@ final class SigstoreVerificationTests: XCTestCase {
     func testAutomicVault280ProvenanceFixture() async throws {
         let (data, root) = try await fixture()
         try verify(data, root: root)
+    }
+
+    func testShardedRekorCheckpointHost() throws {
+        let host = "log2025-1.rekor.sigstore.dev"
+        let privateKey = Curve25519.Signing.PrivateKey()
+        let key = SigstoreTrustedRoot.PublicKey(
+            rawBytes: Data(hex: "302a300506032b6570032100")!
+                + privateKey.publicKey.rawRepresentation,
+            keyDetails: "PKIX_ED25519",
+            validFor: nil
+        )
+        let logID = Data(repeating: 0x42, count: 32)
+        let rootHash = Data(repeating: 0x24, count: 32)
+        let signed = "\(host) - 1234\n42\n\(rootHash.base64EncodedString())\n"
+        var signature = Data(logID.prefix(4))
+        signature.append(try privateKey.signature(for: Data(signed.utf8)))
+        let checkpoint = "\(signed)\n— \(host) \(signature.base64EncodedString())\n"
+
+        try BundleVerifier.verifyCheckpoint(
+            checkpoint,
+            treeSize: 42,
+            rootHash: rootHash,
+            logID: logID,
+            expectedHost: host,
+            key: key
+        )
+        XCTAssertThrowsError(try BundleVerifier.verifyCheckpoint(
+            checkpoint.replacingOccurrences(
+                of: "— \(host) ",
+                with: "— rekor.sigstore.dev "
+            ),
+            treeSize: 42,
+            rootHash: rootHash,
+            logID: logID,
+            expectedHost: host,
+            key: key
+        ))
     }
 
     func testMutationsAreRejected() async throws {

@@ -46,7 +46,11 @@ struct SigstoreTrustedRoot: Decodable, Sendable {
     let tlogs: [Log]
     let ctlogs: [Log]
 
-    func logKey(id: Data, at date: Date, certificateTransparency: Bool = false) throws -> PublicKey {
+    func transparencyLog(
+        id: Data,
+        at date: Date,
+        certificateTransparency: Bool = false
+    ) throws -> Log {
         let logs = certificateTransparency ? ctlogs : tlogs
         guard let log = logs.first(where: {
             guard $0.logId.keyId == id,
@@ -57,7 +61,15 @@ struct SigstoreTrustedRoot: Decodable, Sendable {
                 ? host == "ctfe.sigstore.dev"
                 : host == "rekor.sigstore.dev" || host.hasSuffix(".rekor.sigstore.dev")
         }) else { throw AttestationFailure.invalid("unknown or inactive transparency log") }
-        return log.publicKey
+        return log
+    }
+
+    func logKey(id: Data, at date: Date, certificateTransparency: Bool = false) throws -> PublicKey {
+        try transparencyLog(
+            id: id,
+            at: date,
+            certificateTransparency: certificateTransparency
+        ).publicKey
     }
 }
 
