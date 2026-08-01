@@ -18,13 +18,15 @@ let package = Package(
             dependencies: ["Version"],
             path: ".",
             exclude: ["LICENSE.md", "README.md", "Tests"],
-            sources: ["AppUpdater.swift"]
+            sources: ["AppUpdater.swift", "Attestation"],
+            resources: [.process("Resources")]
         ),
         .testTarget(
             name: "AppUpdaterTests",
             dependencies: ["AppUpdater"],
             path: "Tests",
-            exclude: ["MANUAL.md"]
+            exclude: ["MANUAL.md"],
+            resources: [.process("Fixtures")]
         ),
     ],
     swiftLanguageModes: [.v6]
