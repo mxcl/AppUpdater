@@ -15,7 +15,7 @@ from downloading and preparing an installation.
 
 ```swift
 package.dependencies.append(
-    .package(url: "https://github.com/mxcl/AppUpdater.git", from: "4.0.0")
+    .package(url: "https://github.com/mxcl/AppUpdater.git", from: "4.1.0")
 )
 ```
 
@@ -119,6 +119,35 @@ let updater = AppUpdater(
 )
 ```
 
+### GitHub Actions provenance
+
+AppUpdater 4.1 can additionally require GitHub Artifact Attestation provenance:
+
+```swift
+let updater = AppUpdater(
+    owner: "example",
+    repo: "MyApp",
+    configuration: .init(
+        attestationPolicy: GitHubAttestationPolicy(
+            workflow: ".github/workflows/release.yml",
+            sourceRef: "refs/heads/main"
+        )
+    )
+)
+```
+
+This is opt-in. The default `attestationPolicy == nil` retains AppUpdater 4.0
+behavior. When enabled, the GitHub release must expose its exact 40-character
+target commit and a `sha256:` digest for the DMG. The configured workflow must
+publish SLSA provenance v1 with GitHub's workflow build type, use a GitHub-hosted
+runner, and attest the DMG filename, digest, repository, workflow, ref, and
+resolved source commit.
+
+Only public GitHub Actions bundles using Sigstore's public-good Fulcio, Rekor,
+and CT logs are supported. GitHub release attestations, private-repository RFC
+3161 bundles, SBOM predicates, generic Sigstore identities, other build types,
+and other trust domains are rejected.
+
 ## Security model
 
 AppUpdater aims to prevent privilege amplification. A same-user attacker must
@@ -136,6 +165,30 @@ code, strict sealed resources, app-like bundle structure, and restricted
 symlinks. AppUpdater rejects ad-hoc, development, self-signed, and broad custom
 requirements such as `designated => true`.
 
+With an attestation policy, provenance verification is an additional mandatory
+gate; Developer ID validation is never used as a fallback. AppUpdater streams
+and hashes the downloaded DMG, matches GitHub's release digest, and verifies the
+Sigstore v0.3 DSSE bundle before mounting. Verification covers the Fulcio chain
+and signing time, code-signing EKU, GitHub OIDC certificate claims, SCT, DSSE
+signature, Rekor SET, RFC 6962 inclusion proof, signed checkpoint, and the
+supported in-toto/SLSA assertions. After Finder promotion, AppUpdater hashes
+the protected copy again and refuses to mount it unless the verified digest is
+unchanged.
+
+Sigstore trust is bootstrapped from the root shipped with AppUpdater and
+refreshed from Sigstore's public TUF repository. Refresh performs sequential
+root rotation and threshold verification, then verifies timestamp, snapshot,
+targets, hashes, lengths, expiry, and rollback state. Cache writes are atomic;
+an offline cache is used only when its complete signed metadata chain remains
+valid, otherwise the shipped trusted-root snapshot is used. Malformed or
+cryptographically invalid online metadata is never treated as an offline
+failure.
+
+Missing, malformed, expired, unsupported, oversized, or unverifiable
+attestation material fails `prepareInstallation()` with
+`AppUpdaterError.attestationVerificationFailed`. No DMG is mounted and no
+installation change is attempted.
+
 AppUpdater downloads into a private directory, mounts the DMG read-only, and
 keeps the validated mount alive. For a protected installation, Finder copies
 the DMG itself into a randomized hidden sibling of the installed app. AppUpdater
@@ -149,10 +202,12 @@ that user's control. AppUpdater still uses a private same-parent DMG copy and
 performs the same validation and rollback transaction, but it cannot protect
 that path from another process running as the same user.
 
-The signature check does not bind a GitHub release version to the version inside
-the app. AppUpdater provides no rollback protection and performs no Gatekeeper
-or notarization assessment. A compromised Developer ID signing key can produce
-an update that passes the identity checks.
+Neither mode binds a GitHub release version to the version inside the app or
+performs a Gatekeeper/notarization assessment. Without an attestation policy,
+AppUpdater provides no release provenance or rollback protection and a
+compromised Developer ID key can produce an update that passes identity checks.
+With a policy, a candidate must also originate from the configured GitHub
+workflow/ref and resolve to the release's exact source commit.
 
 ## Alternatives
 
