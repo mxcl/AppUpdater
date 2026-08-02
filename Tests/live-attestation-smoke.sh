@@ -103,11 +103,11 @@ EOF
 
 swift build -c release --package-path "$package"
 bin="$(swift build -c release --package-path "$package" --show-bin-path)"
-cp "$bin/Smoke" "$app/Contents/MacOS/Smoke"
+cp "$bin/Smoke" "$app/Contents/MacOS/AutomicVaultMenubar"
 find "$bin" -maxdepth 1 -name '*.bundle' -exec cp -R {} "$app/Contents/Resources/" \;
 
 plutil -create xml1 "$app/Contents/Info.plist"
-plutil -insert CFBundleExecutable -string Smoke "$app/Contents/Info.plist"
+plutil -insert CFBundleExecutable -string AutomicVaultMenubar "$app/Contents/Info.plist"
 plutil -insert CFBundleIdentifier -string com.automicvault "$app/Contents/Info.plist"
 plutil -insert CFBundleName -string 'Automic Vault' "$app/Contents/Info.plist"
 plutil -insert CFBundlePackageType -string APPL "$app/Contents/Info.plist"
@@ -120,7 +120,7 @@ codesign --force --sign "$identity" --options runtime --timestamp "$app"
 codesign --verify --deep --strict "$app"
 
 echo "Disposable app: $app"
-"$app/Contents/MacOS/Smoke"
+"$app/Contents/MacOS/AutomicVaultMenubar"
 
 if [[ "${APPUPDATER_SMOKE_INSTALL:-}" == "1" ]]; then
   version="$(plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist")"
