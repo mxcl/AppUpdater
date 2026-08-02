@@ -25,7 +25,7 @@ let package = Package(
             name: "AppUpdaterTests",
             dependencies: ["AppUpdater"],
             path: "Tests",
-            exclude: ["MANUAL.md"],
+            exclude: ["MANUAL.md", "live-attestation-smoke.sh"],
             resources: [.process("Fixtures")]
         ),
     ],
