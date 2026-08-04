@@ -19,6 +19,27 @@ package.dependencies.append(
 )
 ```
 
+When Xcode owns your app target it embeds AppUpdater's resources automatically.
+If you assemble the `.app` yourself, build with Xcode's build system and copy
+the resource bundle into the app:
+
+```sh
+$ swift build --build-system xcode --configuration release
+$ SWIFT_BIN="$(swift build --build-system xcode --configuration release --show-bin-path)"
+$ ditto "$SWIFT_BIN/AppUpdater_AppUpdater.bundle" \
+    "MyApp.app/Contents/Resources/AppUpdater_AppUpdater.bundle"
+```
+
+> [!INFO]
+> AppUpdater's Sigstore trust bootstrap is declared as SwiftPM resources.
+> SwiftPM emits declared resources as a separate bundle, and generates
+> `Bundle.module` to load them. AppUpdater 4.1 therefore has no supported
+> bundle-free packaging mode: omitting or renaming
+> `AppUpdater_AppUpdater.bundle` prevents attestation from loading its trust
+> roots. Folding the data into the executable would require a different
+> AppUpdater implementation that generates Swift source instead of packaging
+> the JSON resources; it isn't a choice the consuming app can make.
+
 ## Release layout
 
 AppUpdater only accepts DMG assets. Name each asset
