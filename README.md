@@ -19,6 +19,9 @@ package.dependencies.append(
 )
 ```
 
+AppUpdater compiles its trust bootstrap into the library and requires no
+runtime resource bundle.
+
 ## Release layout
 
 AppUpdater only accepts DMG assets. Name each asset
@@ -175,12 +178,12 @@ supported in-toto/SLSA assertions. After Finder promotion, AppUpdater hashes
 the protected copy again and refuses to mount it unless the verified digest is
 unchanged.
 
-Sigstore trust is bootstrapped from the root shipped with AppUpdater and
+Sigstore trust is bootstrapped from the root compiled into AppUpdater and
 refreshed from Sigstore's public TUF repository. Refresh performs sequential
 root rotation and threshold verification, then verifies timestamp, snapshot,
 targets, hashes, lengths, expiry, and rollback state. Cache writes are atomic;
 an offline cache is used only when its complete signed metadata chain remains
-valid, otherwise the shipped trusted-root snapshot is used. Malformed or
+valid, otherwise the compiled-in trusted-root snapshot is used. Malformed or
 cryptographically invalid online metadata is never treated as an offline
 failure.
 

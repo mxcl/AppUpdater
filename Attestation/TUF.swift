@@ -136,8 +136,8 @@ actor TUFClient {
     }
 
     func trustedRoot() async throws -> SigstoreTrustedRoot {
-        let embeddedRoot = try bootstrapRoot ?? resource("tuf-root")
-        let embeddedTarget = try fallbackTarget ?? resource("trusted-root")
+        let embeddedRoot = bootstrapRoot ?? TrustBootstrap.tufRoot
+        let embeddedTarget = fallbackTarget ?? TrustBootstrap.trustedRoot
         do {
             let target = try await refresh(embeddedRoot: embeddedRoot)
             return try decodeTrustedRoot(target)
@@ -440,13 +440,6 @@ actor TUFClient {
         guard version >= envelope.signed.version else {
             throw AttestationFailure.invalid("TUF metadata rollback")
         }
-    }
-
-    private func resource(_ name: String) throws -> Data {
-        guard let url = Bundle.module.url(forResource: name, withExtension: "json") else {
-            throw AttestationFailure.invalid("missing trust bootstrap")
-        }
-        return try Data(contentsOf: url, options: .mappedIfSafe)
     }
 
     private func cachedData(_ name: String) throws -> Data {

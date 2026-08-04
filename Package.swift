@@ -18,8 +18,7 @@ let package = Package(
             dependencies: ["Version"],
             path: ".",
             exclude: ["LICENSE.md", "README.md", "Tests"],
-            sources: ["AppUpdater.swift", "Attestation"],
-            resources: [.process("Resources")]
+            sources: ["AppUpdater.swift", "Attestation"]
         ),
         .testTarget(
             name: "AppUpdaterTests",

@@ -4,6 +4,16 @@ import XCTest
 final class TUFTests: XCTestCase {
     private let validDate = Date(timeIntervalSince1970: 1_785_531_075)
 
+    func testCompiledBootstrapProvidesOfflineTrustedRoot() async throws {
+        let date = validDate
+        let root = try await TUFClient(
+            fetch: { _, _ in throw URLError(.notConnectedToInternet) },
+            now: { date }
+        ).trustedRoot()
+        XCTAssertFalse(root.certificateAuthorities.isEmpty)
+        XCTAssertFalse(root.tlogs.isEmpty)
+    }
+
     func testSequentialRootRotationAndMetadataChain() async throws {
         let files = try fixtureFiles()
         let root = try await client(files: files, bootstrap: files["14.root.json"]!).trustedRoot()

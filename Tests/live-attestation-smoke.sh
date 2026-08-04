@@ -104,7 +104,6 @@ EOF
 swift build -c release --package-path "$package"
 bin="$(swift build -c release --package-path "$package" --show-bin-path)"
 cp "$bin/Smoke" "$app/Contents/MacOS/AutomicVaultMenubar"
-find "$bin" -maxdepth 1 -name '*.bundle' -exec cp -R {} "$app/Contents/Resources/" \;
 
 plutil -create xml1 "$app/Contents/Info.plist"
 plutil -insert CFBundleExecutable -string AutomicVaultMenubar "$app/Contents/Info.plist"
@@ -118,6 +117,7 @@ plutil -insert LSUIElement -bool true "$app/Contents/Info.plist"
 
 codesign --force --sign "$identity" --options runtime --timestamp "$app"
 codesign --verify --deep --strict "$app"
+mv "$package/.build" "$work/detached-build"
 
 echo "Disposable app: $app"
 "$app/Contents/MacOS/AutomicVaultMenubar"
