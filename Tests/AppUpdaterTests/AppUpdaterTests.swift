@@ -145,6 +145,45 @@ final class AppUpdaterTests: XCTestCase {
         }
     }
 
+    func testNetworkTransferDescribesConnectionFailureWithoutLeakingURL() async throws {
+        let failingURL = URL(
+            string: "https://release-assets.githubusercontent.com/update.dmg?token=secret"
+        )!
+        let session = URLSession.stubbed(
+            error: URLError(
+                .cannotConnectToHost,
+                userInfo: [NSURLErrorFailingURLErrorKey: failingURL]
+            )
+        )
+        let request = URLRequest(
+            url: URL(string: "https://github.com/update.dmg")!
+        )
+
+        do {
+            _ = try await NetworkTransfer.data(
+                for: request,
+                with: session,
+                maximumBytes: 100
+            )
+            XCTFail("transfer should throw")
+        } catch let error as AppUpdaterNetworkError {
+            XCTAssertEqual(error.host, "release-assets.githubusercontent.com")
+            XCTAssertEqual(error.code, .cannotConnectToHost)
+            XCTAssertEqual(
+                error.localizedDescription,
+                "Could not connect to release-assets.githubusercontent.com."
+            )
+            XCTAssertEqual(error.failureReason, "Network error -1004.")
+            XCTAssertEqual(
+                error.recoverySuggestion,
+                "Check your internet connection and try again."
+            )
+            XCTAssertFalse(error.localizedDescription.contains("secret"))
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+    }
+
     func testNetworkTransferRejectsHTTPSDowngradeRedirect() async throws {
         let delegate = NetworkTransfer.TransferDelegate(maximumBytes: 100)
         let session = URLSession.shared
@@ -1456,6 +1495,7 @@ private final class RequestRecorder: @unchecked Sendable {
 
 private final class URLProtocolStub: URLProtocol, @unchecked Sendable {
     private nonisolated(unsafe) static var body = Data()
+    private nonisolated(unsafe) static var error: Error?
     private nonisolated(unsafe) static var recordedRequests: [URLRequest] = []
     private nonisolated(unsafe) static var responseURL: URL?
 
@@ -1463,8 +1503,14 @@ private final class URLProtocolStub: URLProtocol, @unchecked Sendable {
         recordedRequests
     }
 
-    static func configure(statusCode: Int, body: String, responseURL: URL?) {
+    static func configure(
+        statusCode: Int,
+        body: String,
+        responseURL: URL?,
+        error: Error? = nil
+    ) {
         self.body = Data(body.utf8)
+        self.error = error
         recordedRequests = []
         self.statusCode = statusCode
         self.responseURL = responseURL
@@ -1482,6 +1528,10 @@ private final class URLProtocolStub: URLProtocol, @unchecked Sendable {
 
     override func startLoading() {
         Self.recordedRequests.append(request)
+        if let error = Self.error {
+            client?.urlProtocol(self, didFailWithError: error)
+            return
+        }
         let response = HTTPURLResponse(
             url: Self.responseURL ?? request.url!,
             statusCode: Self.statusCode,
@@ -1497,6 +1547,18 @@ private final class URLProtocolStub: URLProtocol, @unchecked Sendable {
 }
 
 private extension URLSession {
+    static func stubbed(error: Error) -> URLSession {
+        URLProtocolStub.configure(
+            statusCode: 0,
+            body: "",
+            responseURL: nil,
+            error: error
+        )
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [URLProtocolStub.self]
+        return URLSession(configuration: configuration)
+    }
+
     static func stubbed(
         statusCode: Int,
         body: String,

@@ -372,6 +372,38 @@ public final class PreparedUpdate {
     }
 }
 
+public struct AppUpdaterNetworkError: LocalizedError, Equatable, Sendable {
+    public let host: String
+    public let code: URLError.Code
+
+    public var errorDescription: String? {
+        switch code {
+        case .cannotFindHost:
+            "Could not find \(host)."
+        case .networkConnectionLost:
+            "The connection to \(host) was lost."
+        case .notConnectedToInternet:
+            "This Mac is not connected to the internet."
+        case .secureConnectionFailed,
+             .serverCertificateHasBadDate,
+             .serverCertificateUntrusted,
+             .serverCertificateHasUnknownRoot,
+             .serverCertificateNotYetValid:
+            "Could not establish a secure connection to \(host)."
+        default:
+            "Could not connect to \(host)."
+        }
+    }
+
+    public var failureReason: String? {
+        "Network error \(code.rawValue)."
+    }
+
+    public var recoverySuggestion: String? {
+        "Check your internet connection and try again."
+    }
+}
+
 public enum AppUpdaterError: LocalizedError, Equatable {
     case bundleExecutableURL
     case attestationVerificationFailed
@@ -481,7 +513,7 @@ enum NetworkTransfer {
             if let error = delegate.error { throw error }
             return data
         } catch {
-            throw delegate.error ?? mapped(error)
+            throw delegate.error ?? mapped(error, fallbackURL: request.url)
         }
     }
 
@@ -513,15 +545,22 @@ enum NetworkTransfer {
                 ofItemAtPath: destination.path
             )
         } catch {
-            throw delegate.error ?? mapped(error)
+            throw delegate.error ?? mapped(error, fallbackURL: url)
         }
     }
 
-    private static func mapped(_ error: Error) -> Error {
-        if (error as? URLError)?.code == .timedOut {
+    private static func mapped(_ error: Error, fallbackURL: URL?) -> Error {
+        guard let urlError = error as? URLError else { return error }
+        if urlError.code == .timedOut {
             return AppUpdaterError.operationTimedOut
         }
-        return error
+        if urlError.code == .cancelled { return error }
+
+        let failingURL = (error as NSError).userInfo[NSURLErrorFailingURLErrorKey] as? URL
+        return AppUpdaterNetworkError(
+            host: failingURL?.host ?? fallbackURL?.host ?? "the update server",
+            code: urlError.code
+        )
     }
 
     private static func validate(
