@@ -473,6 +473,7 @@ actor TUFClient {
 
     private static func isNetworkFailure(_ error: Error) -> Bool {
         if error is CancellationError { return false }
+        if error is AppUpdaterNetworkError { return true }
         if let error = error as? URLError { return error.code != .cancelled }
         guard let error = error as? AppUpdaterError else { return false }
         return error == .invalidHTTPResponse || error == .operationTimedOut

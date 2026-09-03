@@ -89,6 +89,24 @@ final class TUFTests: XCTestCase {
         }
     }
 
+    func testMappedNetworkFailureUsesEmbeddedFallback() async throws {
+        let date = validDate
+        let client = TUFClient(
+            fetch: { _, _ in
+                throw AppUpdaterNetworkError(
+                    host: "tuf-repo-cdn.sigstore.dev",
+                    code: .notConnectedToInternet
+                )
+            },
+            now: { date },
+            bootstrapRoot: try fixture("15.root.json"),
+            fallbackTarget: try fixture("trusted-root.json")
+        )
+
+        let root = try await client.trustedRoot()
+        XCTAssertFalse(root.certificateAuthorities.isEmpty)
+    }
+
     func testOversizedMetadataFailureDoesNotUseFallback() async throws {
         let bootstrap = try fixture("15.root.json")
         let fallback = try fixture("trusted-root.json")
