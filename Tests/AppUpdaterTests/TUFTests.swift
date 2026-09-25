@@ -107,6 +107,22 @@ final class TUFTests: XCTestCase {
         XCTAssertFalse(root.certificateAuthorities.isEmpty)
     }
 
+    func testHTTPFailureUsesEmbeddedFallback() async throws {
+        let date = validDate
+        let client = TUFClient(
+            fetch: { url, _ in
+                throw AppUpdaterHTTPError(response: HTTPURLResponse(
+                    url: url, statusCode: 503, httpVersion: nil, headerFields: nil
+                )!)
+            },
+            now: { date },
+            bootstrapRoot: try fixture("15.root.json"),
+            fallbackTarget: try fixture("trusted-root.json")
+        )
+        let root = try await client.trustedRoot()
+        XCTAssertFalse(root.certificateAuthorities.isEmpty)
+    }
+
     func testMappedCancellationDoesNotUseEmbeddedFallback() async throws {
         let date = validDate
         let client = TUFClient(

@@ -83,7 +83,74 @@ final class AppUpdaterTests: XCTestCase {
             )
             XCTFail("fetch should throw")
         } catch {
-            XCTAssertEqual(error as? AppUpdaterError, .invalidHTTPResponse)
+            let httpError = try XCTUnwrap(error as? AppUpdaterHTTPError)
+            XCTAssertEqual(httpError.response.statusCode, 500)
+            XCTAssertEqual(httpError.response.url?.host, "api.github.com")
+            XCTAssertEqual(httpError.failureReason, "HTTP 500 (internal server error).")
+        }
+    }
+
+    func testHTTPFailuresPreserveResponseWithoutLeakingSignedURL() async throws {
+        let url = URL(string: "https://example.com/update?token=secret")!
+        for (status, headers, rateLimited) in [
+            (403, ["X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1790341622"], true),
+            (403, [:], false),
+            (429, ["Retry-After": "60"], true),
+            (503, ["Retry-After": "120"], false),
+        ] {
+            let session = URLSession.stubbed(
+                statusCode: status, body: "secret response body",
+                responseURL: url, headers: headers
+            )
+            do {
+                _ = try await NetworkTransfer.data(
+                    for: URLRequest(url: url), with: session, maximumBytes: 100
+                )
+                XCTFail("transfer should throw")
+            } catch let error as AppUpdaterHTTPError {
+                XCTAssertEqual(error.response.statusCode, status)
+                XCTAssertEqual(error.response.url, url)
+                for (name, value) in headers {
+                    XCTAssertEqual(error.response.value(forHTTPHeaderField: name), value)
+                }
+                XCTAssertEqual(error.localizedDescription.contains("rate limiting"), rateLimited)
+                XCTAssertEqual(error.recoverySuggestion, status == 403 && !rateLimited ? nil : "Try again later.")
+                let alertText = [error.localizedDescription, error.failureReason ?? "", error.recoverySuggestion ?? ""].joined()
+                XCTAssertFalse(alertText.contains("secret"))
+                XCTAssertFalse(alertText.contains("token="))
+            }
+        }
+    }
+
+    func testDownloadHTTPFailureDoesNotPromoteFile() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let destination = root.appendingPathComponent("update.dmg")
+        do {
+            try await NetworkTransfer.download(
+                URL(string: "https://example.com/update.dmg")!,
+                with: .stubbed(statusCode: 503, body: "unavailable"),
+                to: destination, maximumBytes: 100, timeout: 10
+            )
+            XCTFail("download should throw")
+        } catch let error as AppUpdaterHTTPError {
+            XCTAssertEqual(error.response.statusCode, 503)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+    }
+
+    func testNetworkTimeoutPreservesUnderlyingError() async throws {
+        let original = URLError(.timedOut, userInfo: ["diagnostic": "retained"])
+        do {
+            _ = try await NetworkTransfer.data(
+                for: URLRequest(url: URL(string: "https://example.com/releases")!),
+                with: .stubbed(error: original), maximumBytes: 100
+            )
+            XCTFail("transfer should throw")
+        } catch let error as AppUpdaterNetworkError {
+            XCTAssertEqual(error.code, .timedOut)
+            XCTAssertEqual(error.underlyingError?.userInfo["diagnostic"] as? String, "retained")
+            XCTAssertEqual(error.localizedDescription, "The connection to example.com timed out.")
         }
     }
 
@@ -169,6 +236,11 @@ final class AppUpdaterTests: XCTestCase {
         } catch let error as AppUpdaterNetworkError {
             XCTAssertEqual(error.host, "release-assets.githubusercontent.com")
             XCTAssertEqual(error.code, .cannotConnectToHost)
+            XCTAssertEqual(error.underlyingError?.code, .cannotConnectToHost)
+            XCTAssertEqual(
+                (error.underlyingError as NSError?)?.userInfo[NSURLErrorFailingURLErrorKey] as? URL,
+                failingURL
+            )
             XCTAssertEqual(
                 error.localizedDescription,
                 "Could not connect to release-assets.githubusercontent.com."
@@ -1498,6 +1570,7 @@ private final class URLProtocolStub: URLProtocol, @unchecked Sendable {
     private nonisolated(unsafe) static var error: Error?
     private nonisolated(unsafe) static var recordedRequests: [URLRequest] = []
     private nonisolated(unsafe) static var responseURL: URL?
+    private nonisolated(unsafe) static var headers: [String: String] = [:]
 
     static var requests: [URLRequest] {
         recordedRequests
@@ -1507,8 +1580,10 @@ private final class URLProtocolStub: URLProtocol, @unchecked Sendable {
         statusCode: Int,
         body: String,
         responseURL: URL?,
-        error: Error? = nil
+        error: Error? = nil,
+        headers: [String: String] = [:]
     ) {
+        self.headers = headers
         self.body = Data(body.utf8)
         self.error = error
         recordedRequests = []
@@ -1536,7 +1611,7 @@ private final class URLProtocolStub: URLProtocol, @unchecked Sendable {
             url: Self.responseURL ?? request.url!,
             statusCode: Self.statusCode,
             httpVersion: nil,
-            headerFields: nil
+            headerFields: Self.headers
         )!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: Self.body)
@@ -1562,12 +1637,14 @@ private extension URLSession {
     static func stubbed(
         statusCode: Int,
         body: String,
-        responseURL: URL? = nil
+        responseURL: URL? = nil,
+        headers: [String: String] = [:]
     ) -> URLSession {
         URLProtocolStub.configure(
             statusCode: statusCode,
             body: body,
-            responseURL: responseURL
+            responseURL: responseURL,
+            headers: headers
         )
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [URLProtocolStub.self]
