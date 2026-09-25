@@ -372,12 +372,53 @@ public final class PreparedUpdate {
     }
 }
 
+/// An unsuccessful HTTPS response. The response may contain sensitive URLs or headers;
+/// use the localized error text for presentation rather than logging the raw response.
+public struct AppUpdaterHTTPError: LocalizedError, Sendable {
+    public let response: HTTPURLResponse
+
+    public var errorDescription: String? {
+        let host = response.url?.host ?? "The update server"
+        if isRateLimited { return "\(host) is rate limiting update requests." }
+        return "\(host) returned an HTTP error."
+    }
+
+    public var failureReason: String? {
+        let status = response.statusCode
+        return "HTTP \(status) (\(HTTPURLResponse.localizedString(forStatusCode: status)))."
+    }
+
+    public var recoverySuggestion: String? {
+        if isRateLimited || (500..<600).contains(response.statusCode) {
+            return "Try again later."
+        }
+        return nil
+    }
+
+    private var isRateLimited: Bool {
+        response.statusCode == 429 || (
+            response.statusCode == 403 &&
+            response.value(forHTTPHeaderField: "X-RateLimit-Remaining") == "0"
+        )
+    }
+}
+
 public struct AppUpdaterNetworkError: LocalizedError, Equatable, Sendable {
     public let host: String
     public let code: URLError.Code
+    /// Original transport error, including its diagnostic userInfo. May contain sensitive URLs.
+    public let underlyingError: URLError?
+
+    init(host: String, code: URLError.Code, underlyingError: URLError? = nil) {
+        self.host = host
+        self.code = code
+        self.underlyingError = underlyingError
+    }
 
     public var errorDescription: String? {
         switch code {
+        case .timedOut:
+            "The connection to \(host) timed out."
         case .cannotFindHost:
             "Could not find \(host)."
         case .networkConnectionLost:
@@ -551,15 +592,13 @@ enum NetworkTransfer {
 
     private static func mapped(_ error: Error, fallbackURL: URL?) -> Error {
         guard let urlError = error as? URLError else { return error }
-        if urlError.code == .timedOut {
-            return AppUpdaterError.operationTimedOut
-        }
         if urlError.code == .cancelled { return error }
 
         let failingURL = (error as NSError).userInfo[NSURLErrorFailingURLErrorKey] as? URL
         return AppUpdaterNetworkError(
             host: failingURL?.host ?? fallbackURL?.host ?? "the update server",
-            code: urlError.code
+            code: urlError.code,
+            underlyingError: urlError
         )
     }
 
@@ -569,10 +608,12 @@ enum NetworkTransfer {
         permitsCompression: Bool = true
     ) throws {
         guard response.url?.scheme?.lowercased() == "https",
-              let response = response as? HTTPURLResponse,
-              200..<300 ~= response.statusCode
+              let response = response as? HTTPURLResponse
         else {
             throw AppUpdaterError.invalidHTTPResponse
+        }
+        guard 200..<300 ~= response.statusCode else {
+            throw AppUpdaterHTTPError(response: response)
         }
         if let allowedContentTypes {
             guard let contentType = response.value(forHTTPHeaderField: "Content-Type")?
