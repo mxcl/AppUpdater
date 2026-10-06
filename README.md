@@ -43,7 +43,8 @@ $ ditto "$SWIFT_BIN/AppUpdater_AppUpdater.bundle" \
 ## Release layout
 
 AppUpdater only accepts DMG assets. Name each asset
-`<repository>-<semantic-version>.dmg`, for example `MyApp-2.1.0.dmg`.
+`<repository>-<version>.dmg`, for example `MyApp-2.1.0.dmg`. The version is
+read the way the tag is, so a `v2.1` release may name its asset `MyApp-2.1.dmg`.
 
 The mounted DMG must contain one top-level app. Its filename must match the
 installed app, including case. A release for `MyApp.app` therefore contains:
