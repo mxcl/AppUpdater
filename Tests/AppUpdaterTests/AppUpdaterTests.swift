@@ -356,6 +356,18 @@ final class AppUpdaterTests: XCTestCase {
         }
     }
 
+    func testViableAssetPreservesPrereleaseCase() throws {
+        let matching = try release(
+            "v2.0.0-RC.1", prerelease: true, assetName: "APPUPDATER-2.0.0-RC.1.dmg"
+        )
+        XCTAssertEqual(matching.viableAsset(forRepo: "AppUpdater")?.name, "APPUPDATER-2.0.0-RC.1.dmg")
+
+        let mismatched = try release(
+            "v2.0.0-rc.1", prerelease: true, assetName: "AppUpdater-2.0.0-RC.1.dmg"
+        )
+        XCTAssertNil(mismatched.viableAsset(forRepo: "AppUpdater"))
+    }
+
     @MainActor
     func testCheckMatchesAssetNamedWithShortVersion() async throws {
         let releases = try [

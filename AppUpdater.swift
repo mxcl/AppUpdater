@@ -762,8 +762,7 @@ struct Release: Decodable, Comparable {
         let prefix = "\(repo.lowercased())-"
         return assets.first { asset in
             let name = (asset.name as NSString).deletingPathExtension
-                .lowercased()
-            guard asset.contentType == .dmg, name.hasPrefix(prefix) else {
+            guard asset.contentType == .dmg, name.lowercased().hasPrefix(prefix) else {
                 return false
             }
             return Version(tolerant: name.dropFirst(prefix.count)) == tagName
