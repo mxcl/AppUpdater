@@ -755,13 +755,18 @@ struct Release: Decodable, Comparable {
         }
     }
 
+    /// The DMG named `<repo>-<version>.dmg` for this release. The version in
+    /// the name is parsed the way the tag is, so `MyApp-2.1.dmg` matches a
+    /// `v2.1` tag even though the tag prints as `2.1.0`.
     func viableAsset(forRepo repo: String) -> Asset? {
-        assets.first { asset in
-            let prefix = "\(repo.lowercased())-\(tagName)"
+        let prefix = "\(repo.lowercased())-"
+        return assets.first { asset in
             let name = (asset.name as NSString).deletingPathExtension
                 .lowercased()
-
-            return name == prefix && asset.contentType == .dmg
+            guard asset.contentType == .dmg, name.hasPrefix(prefix) else {
+                return false
+            }
+            return Version(tolerant: name.dropFirst(prefix.count)) == tagName
         }
     }
 

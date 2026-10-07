@@ -357,6 +357,46 @@ final class AppUpdaterTests: XCTestCase {
     }
 
     @MainActor
+    func testCheckMatchesAssetNamedWithShortVersion() async throws {
+        let releases = try [
+            release("v2.1", prerelease: false, assetName: "AppUpdater-2.1.dmg"),
+        ]
+        let updater = AppUpdater(
+            owner: "mxcl",
+            repo: "AppUpdater",
+            currentVersion: { Version(2, 0, 0) },
+            fetchReleases: { releases },
+            prepareAsset: { asset in preparedUpdate(assetName: asset.name) }
+        )
+
+        let update = try await updater.check()
+
+        XCTAssertEqual(update?.version, "2.1.0")
+        XCTAssertEqual(update?.assetName, "AppUpdater-2.1.dmg")
+    }
+
+    @MainActor
+    func testCheckDoesNotMatchAssetForAnotherVersion() async throws {
+        let releases = try [
+            release("v2.1", prerelease: false, assetName: "AppUpdater-2.1.1.dmg"),
+        ]
+        let updater = AppUpdater(
+            owner: "mxcl",
+            repo: "AppUpdater",
+            currentVersion: { Version(2, 0, 0) },
+            fetchReleases: { releases },
+            prepareAsset: { _ in
+                XCTFail("update should not run")
+                return preparedUpdate()
+            }
+        )
+
+        let update = try await updater.check()
+
+        XCTAssertNil(update)
+    }
+
+    @MainActor
     func testCheckDoesNotUpdateWithoutMatchingAsset() async throws {
         let releases = try [
             release("2.0.0", prerelease: false, assetName: "OtherApp-2.0.0.dmg"),
@@ -1447,7 +1487,9 @@ final class AppUpdaterTests: XCTestCase {
         }
         """.data(using: .utf8)!
 
-        return try JSONDecoder().decode(Release.self, from: json)
+        let decoder = JSONDecoder()
+        decoder.userInfo[.decodingMethod] = DecodingMethod.tolerant
+        return try decoder.decode(Release.self, from: json)
     }
 
     private func temporaryDirectory() throws -> URL {
