@@ -1197,26 +1197,34 @@ final class AppUpdaterTests: XCTestCase {
     }
 
     /// A delegate that returns `.terminateLater` and replies from the main
-    /// queue: `NSApp.terminate` waits in a nested `.modalPanel` loop, which
-    /// cannot drain the queue while the job that called it still holds it.
+    /// queue: `NSApp.terminate` waits in a nested loop for the reply, which
+    /// can run only once no main-queue job holds the queue. The calling job
+    /// here keeps it and runs a nested loop of its own, as a host showing a
+    /// modal alert after the install would.
     @MainActor
-    func testTerminationWaitsForTheMainActorJobToReturn() async {
-        var terminated = false
-        var queuedReplyRan = false
-        ApplicationTerminator.terminateFromRunLoop { terminated = true }
-        XCTAssertFalse(terminated)
-
-        DispatchQueue.main.async { queuedReplyRan = true }
-        spinModalPanelLoop(until: { terminated })
-        XCTAssertTrue(terminated)
-        XCTAssertFalse(queuedReplyRan)
+    func testTerminationWaitsForTheCallingJobToReturn() async {
+        // AppKit makes `.modalPanel` a common mode, which serves the main
+        // queue, when the application object is created.
+        _ = NSApplication.shared
+        var replied: Bool?
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            ApplicationTerminator.terminateFromRunLoop {
+                var didReply = false
+                DispatchQueue.main.async { didReply = true }
+                self.spinNestedLoop(for: 1, until: { didReply })
+                replied = didReply
+                continuation.resume()
+            }
+            spinNestedLoop(for: 0.2, until: { replied != nil })
+            XCTAssertNil(replied, "terminated while the calling job held the main queue")
+        }
+        XCTAssertEqual(replied, true)
     }
 
-    /// The nested loop `NSApp.terminate` runs while it waits for a reply.
-    /// Synchronous, so the async test above calls it from inside its job.
+    /// The `.modalPanel` loop `NSApp.terminate` waits in.
     @MainActor
-    private func spinModalPanelLoop(until done: () -> Bool) {
-        let deadline = Date().addingTimeInterval(1)
+    private func spinNestedLoop(for seconds: TimeInterval, until done: () -> Bool) {
+        let deadline = Date().addingTimeInterval(seconds)
         while !done(), Date() < deadline {
             RunLoop.main.run(mode: .modalPanel, before: deadline)
         }

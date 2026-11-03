@@ -1289,13 +1289,20 @@ enum ApplicationTerminator {
     /// `NSApp.terminate` wait in a nested run loop for a reply, and a reply
     /// sent from a `Task` or `DispatchQueue.main` needs that same queue, so
     /// it never arrives and the old instance keeps running from the removed
-    /// backup. A run-loop block runs outside the queue.
+    /// backup.
+    ///
+    /// A run-loop block alone also fires inside a nested loop the calling job
+    /// starts after the install, such as a modal alert, while that job still
+    /// holds the queue. So the block is registered from the main queue, which
+    /// runs once the calling job has returned, and then runs outside it.
     static func terminateFromRunLoop(
         terminate: @escaping @MainActor () -> Void = { NSApp.terminate(nil) }
     ) {
-        // The main run loop runs its blocks on the main thread.
-        RunLoop.main.perform(inModes: [.default, .modalPanel, .eventTracking]) {
-            MainActor.assumeIsolated { terminate() }
+        DispatchQueue.main.async {
+            // The main run loop runs its blocks on the main thread.
+            RunLoop.main.perform(inModes: [.default, .modalPanel, .eventTracking]) {
+                MainActor.assumeIsolated { terminate() }
+            }
         }
     }
 }
