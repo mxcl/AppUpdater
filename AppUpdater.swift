@@ -1276,8 +1276,28 @@ struct InstallationDriver {
         launch: { url in
             try await ApplicationLauncher.launchNewInstance(at: url)
         },
-        terminate: { NSApp.terminate(nil) }
+        terminate: { ApplicationTerminator.terminateFromRunLoop() }
     )
+}
+
+@MainActor
+enum ApplicationTerminator {
+    /// Terminates the app once the current main-actor job has returned.
+    ///
+    /// `installAndRelaunch()` runs inside a main-actor job, which holds the
+    /// main queue. A delegate that returns `.terminateLater` makes
+    /// `NSApp.terminate` wait in a nested run loop for a reply, and a reply
+    /// sent from a `Task` or `DispatchQueue.main` needs that same queue, so
+    /// it never arrives and the old instance keeps running from the removed
+    /// backup. A run-loop block runs outside the queue.
+    static func terminateFromRunLoop(
+        terminate: @escaping @MainActor () -> Void = { NSApp.terminate(nil) }
+    ) {
+        // The main run loop runs its blocks on the main thread.
+        RunLoop.main.perform(inModes: [.default, .modalPanel, .eventTracking]) {
+            MainActor.assumeIsolated { terminate() }
+        }
+    }
 }
 
 @MainActor

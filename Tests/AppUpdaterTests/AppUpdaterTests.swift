@@ -1196,6 +1196,32 @@ final class AppUpdaterTests: XCTestCase {
         ])
     }
 
+    /// A delegate that returns `.terminateLater` and replies from the main
+    /// queue: `NSApp.terminate` waits in a nested `.modalPanel` loop, which
+    /// cannot drain the queue while the job that called it still holds it.
+    @MainActor
+    func testTerminationWaitsForTheMainActorJobToReturn() async {
+        var terminated = false
+        var queuedReplyRan = false
+        ApplicationTerminator.terminateFromRunLoop { terminated = true }
+        XCTAssertFalse(terminated)
+
+        DispatchQueue.main.async { queuedReplyRan = true }
+        spinModalPanelLoop(until: { terminated })
+        XCTAssertTrue(terminated)
+        XCTAssertFalse(queuedReplyRan)
+    }
+
+    /// The nested loop `NSApp.terminate` runs while it waits for a reply.
+    /// Synchronous, so the async test above calls it from inside its job.
+    @MainActor
+    private func spinModalPanelLoop(until done: () -> Bool) {
+        let deadline = Date().addingTimeInterval(1)
+        while !done(), Date() < deadline {
+            RunLoop.main.run(mode: .modalPanel, before: deadline)
+        }
+    }
+
     @MainActor
     func testRelaunchRejectsUnreadySpawnedProcess() async {
         do {
