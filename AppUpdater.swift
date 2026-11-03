@@ -1299,7 +1299,9 @@ enum ApplicationTerminator {
         terminate: @escaping @MainActor () -> Void = { NSApp.terminate(nil) }
     ) {
         DispatchQueue.main.async {
-            // The main run loop runs its blocks on the main thread.
+            // The main queue has returned to the run loop by the time this
+            // block runs, so the delegate's reply can use it. The run loop
+            // runs blocks on the main thread.
             RunLoop.main.perform(inModes: [.default, .modalPanel, .eventTracking]) {
                 MainActor.assumeIsolated { terminate() }
             }
