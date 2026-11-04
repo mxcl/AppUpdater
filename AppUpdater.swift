@@ -1276,8 +1276,62 @@ struct InstallationDriver {
         launch: { url in
             try await ApplicationLauncher.launchNewInstance(at: url)
         },
-        terminate: { NSApp.terminate(nil) }
+        terminate: { ApplicationTerminator.terminateFromRunLoop() }
     )
+}
+
+@MainActor
+enum ApplicationTerminator {
+    /// Terminates the app from the main run loop, outside any main-queue job.
+    ///
+    /// `installAndRelaunch()` runs inside a main-actor job, which holds the
+    /// main queue. A delegate that returns `.terminateLater` makes
+    /// `NSApp.terminate` wait in a nested run loop for a reply, and a reply
+    /// sent from a `Task` or `DispatchQueue.main` needs that same queue, so
+    /// it never arrives and the old instance keeps running from the removed
+    /// backup.
+    ///
+    /// A run-loop block fires in any nested loop a main-queue job runs, such
+    /// as a modal alert, while that job still holds the queue. So the block
+    /// terminates only when the queue is free, and otherwise tries again once
+    /// the current job has returned.
+    static func terminateFromRunLoop(
+        terminate: @escaping @MainActor () -> Void = { NSApp.terminate(nil) }
+    ) {
+        // Registered from the main queue, so the block cannot fire inside the
+        // calling job. The run loop runs blocks on the main thread.
+        DispatchQueue.main.async {
+            RunLoop.main.perform(inModes: [.default, .modalPanel, .eventTracking]) {
+                MainActor.assumeIsolated {
+                    if isMainQueueFree() {
+                        terminate()
+                    } else {
+                        terminateFromRunLoop(terminate: terminate)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether no main-queue job is on the stack.
+    ///
+    /// A job's nested run loop cannot drain the main queue again, so a block
+    /// queued here runs during one pass of the loop only when the queue is
+    /// free. The pass uses the current mode, so a modal or tracking loop
+    /// processes nothing it would not have processed anyway.
+    private static func isMainQueueFree() -> Bool {
+        let probe = Probe()
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated { probe.ran = true }
+        }
+        let mode = CFRunLoopCopyCurrentMode(CFRunLoopGetMain()) ?? .defaultMode
+        CFRunLoopRunInMode(mode, 0, true)
+        return probe.ran
+    }
+
+    private final class Probe {
+        var ran = false
+    }
 }
 
 @MainActor
