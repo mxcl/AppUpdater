@@ -1198,35 +1198,45 @@ final class AppUpdaterTests: XCTestCase {
 
     /// A delegate that returns `.terminateLater` and replies from the main
     /// queue: `NSApp.terminate` waits in a nested loop for the reply, which
-    /// can run only once no main-queue job holds the queue. The calling job
-    /// here keeps it and runs a nested loop of its own, as a host showing a
-    /// modal alert after the install would.
+    /// can run only once no main-queue job holds the queue. Two jobs hold it
+    /// here with nested loops of their own, as a host showing a modal alert
+    /// would: the calling job, and a second job queued behind the call.
     @MainActor
-    func testTerminationWaitsForTheCallingJobToReturn() async {
+    func testTerminationWaitsForTheMainQueueToBeFree() async {
         // AppKit makes `.modalPanel` a common mode, which serves the main
         // queue, when the application object is created.
         _ = NSApplication.shared
         var replied: Bool?
+        var terminations = 0
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             ApplicationTerminator.terminateFromRunLoop {
+                terminations += 1
                 var didReply = false
                 DispatchQueue.main.async { didReply = true }
                 self.spinNestedLoop(for: 1, until: { didReply })
                 replied = didReply
                 continuation.resume()
             }
+            DispatchQueue.main.async {
+                self.spinNestedLoop(for: 0.2, until: { replied != nil })
+                XCTAssertNil(replied, "terminated while a later job held the main queue")
+            }
             spinNestedLoop(for: 0.2, until: { replied != nil })
             XCTAssertNil(replied, "terminated while the calling job held the main queue")
         }
         XCTAssertEqual(replied, true)
+        XCTAssertEqual(terminations, 1)
     }
 
-    /// The `.modalPanel` loop `NSApp.terminate` waits in.
+    /// The `.modalPanel` loop `NSApp.terminate` waits in. Polled with a zero
+    /// timeout: the run loop's own timeout cannot fire inside a main-queue
+    /// job, which is where this loop runs.
     @MainActor
     private func spinNestedLoop(for seconds: TimeInterval, until done: () -> Bool) {
         let deadline = Date().addingTimeInterval(seconds)
         while !done(), Date() < deadline {
-            RunLoop.main.run(mode: .modalPanel, before: deadline)
+            CFRunLoopRunInMode(CFRunLoopMode(RunLoop.Mode.modalPanel.rawValue as CFString), 0, true)
+            usleep(1000)
         }
     }
 

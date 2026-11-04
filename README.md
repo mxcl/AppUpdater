@@ -120,8 +120,8 @@ the old instance exits and an armed fallback launches the installed app.
 > AppUpdater is copying the replacement, the transaction cannot finish or
 > relaunch the app. Let `installAndRelaunch()` terminate the old instance after
 > replacement and validation complete. It calls `NSApp.terminate(_:)` from the
-> main run loop once its own main-actor job has returned, so a delegate that
-> answers `.terminateLater` can reply from a `Task` or the main queue. The call
+> main run loop, outside any main-queue job, so a delegate that answers
+> `.terminateLater` can reply from a `Task` or the main queue. The call
 > therefore returns before the app quits, and code after the `await` runs.
 
 ## Configuration
